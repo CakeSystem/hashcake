@@ -10,7 +10,10 @@ SERVICE_NAME="${HASHCAKE_SERVICE:-hashcake}"
 SERVICE_USER="${HASHCAKE_USER:-hashcake}"
 SERVICE_GROUP="${HASHCAKE_GROUP:-${SERVICE_USER}}"
 INSTALL_DIR="${HASHCAKE_HOME:-/opt/hashcake}"
-CONFIG_FILE="${HASHCAKE_CONFIG:-${INSTALL_DIR}/hashcake.yaml}"
+CONFIG_DIR="${HASHCAKE_CONFIG_DIR:-${INSTALL_DIR}/config}"
+CONFIG_FILE="${HASHCAKE_CONFIG:-${CONFIG_DIR}/hashcake.yaml}"
+[ -z "${HASHCAKE_CONFIG:-}" ] || CONFIG_DIR="$(dirname -- "${CONFIG_FILE}")"
+LEGACY_CONFIG_FILE="${INSTALL_DIR}/hashcake.yaml"
 STATE_DIR="${HASHCAKE_STATE_DIR:-${INSTALL_DIR}/state}"
 LOG_DIR="${HASHCAKE_LOG_DIR:-${INSTALL_DIR}/logs}"
 BACKUP_DIR="${HASHCAKE_BACKUP_DIR:-${INSTALL_DIR}/backup}"
@@ -23,11 +26,15 @@ URL_PREFIX="${HASHCAKE_URL_PREFIX:-}"
 HTTPS_ACTIVE="${HASHCAKE_HTTPS_ACTIVE:-}"
 
 UPDATE_MANIFEST_URL="${HASHCAKE_UPDATE_MANIFEST_URL:-}"
+DOWNLOAD_SHA256="${HASHCAKE_DOWNLOAD_SHA256:-}"
 RUST_LOG_VALUE="${RUST_LOG:-hashcake=info}"
 BUILD_FEATURES="${HASHCAKE_FEATURES:-admin-spa}"
 START_AFTER_INSTALL="${HASHCAKE_START_AFTER_INSTALL:-1}"
+ALLOW_PRERELEASE="${HASHCAKE_ALLOW_PRERELEASE:-0}"
+EXPECTED_BINARY_VERSION=""
 WEB_PORT_MIN="${HASHCAKE_WEB_PORT_MIN:-10000}"
 WEB_PORT_MAX="${HASHCAKE_WEB_PORT_MAX:-60000}"
+FIRST_WEB_TOKEN=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -48,8 +55,139 @@ need_root() {
   [ "$(id -u)" = "0" ] || die "请使用 root 运行：sudo bash $0"
 }
 
+require_bash_runtime() {
+  [ -n "${BASH_VERSION:-}" ] || die "本脚本必须使用 bash 运行"
+  [ "${BASH_VERSINFO[0]}" -ge 4 ] || die "bash ${BASH_VERSION} 过旧；HashCake 安装器要求 bash >= 4"
+}
+
+require_command() {
+  local command_name="$1"
+  command -v "${command_name}" >/dev/null 2>&1 || die "缺少必要命令：${command_name}"
+}
+
+INSTALLER_LOCK_HELD=0
+INSTALLER_LOCK_FD=""
+
+acquire_installer_lock() {
+  [ "${INSTALLER_LOCK_HELD}" = "0" ] || return 0
+  require_command flock
+  local lock_dir="/run/lock"
+  [ -d "${lock_dir}" ] || lock_dir="/run"
+  exec {INSTALLER_LOCK_FD}>"${lock_dir}/${SERVICE_NAME}-installer.lock"
+  flock -n "${INSTALLER_LOCK_FD}" \
+    || die "另一个 ${APP_NAME} 安装或维护任务正在运行，请稍后重试"
+  INSTALLER_LOCK_HELD=1
+}
+
+validate_safe_absolute_path() {
+  local path="$1" label="$2"
+  case "${path}" in
+    /*) ;;
+    *) die "${label}必须是绝对路径：${path}" ;;
+  esac
+  case "${path}/" in
+    *//*|*/./*|*/../*) die "${label}不能包含重复斜杠、. 或 .. 路径段：${path}" ;;
+  esac
+  case "${path}" in
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
+      die "${label}不能直接使用系统关键目录：${path}"
+      ;;
+  esac
+  case "${path}" in
+    *[%\"\'\\]*) die "${label}包含 systemd unit 不允许的字符：${path}" ;;
+  esac
+}
+
+validate_runtime_inputs() {
+  case "${SERVICE_NAME}" in
+    ''|*[!A-Za-z0-9_.-]*|-*|.*|*.service) die "systemd 服务名必须是不带 .service 后缀的安全名称：${SERVICE_NAME}" ;;
+  esac
+  case "${SERVICE_USER}" in
+    ''|*[!a-z0-9_-]*|[!a-z_]*|-*) die "服务用户名不安全：${SERVICE_USER}" ;;
+  esac
+  case "${SERVICE_GROUP}" in
+    ''|*[!a-z0-9_-]*|[!a-z_]*|-*) die "服务组名不安全：${SERVICE_GROUP}" ;;
+  esac
+  printf '%s' "${RELEASE_REPO}" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' \
+    || die "发布仓库必须是安全的 owner/repo 格式：${RELEASE_REPO}"
+  case "${RELEASE_BRANCH}" in
+    ''|*[!A-Za-z0-9._/-]*|*..*|/*|*/|*//* ) die "发布分支名称不安全：${RELEASE_BRANCH}" ;;
+  esac
+  case "${RELEASE_PLATFORM}" in
+    ''|*[!A-Za-z0-9._-]*) die "发布平台名称不安全：${RELEASE_PLATFORM}" ;;
+  esac
+  if [ "${RELEASE_TAG}" != "latest" ]; then
+    printf '%s' "${RELEASE_TAG}" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
+      || die "版本号必须是 latest 或 SemVer，例如 v1.2.3：${RELEASE_TAG}"
+  fi
+  case "${START_AFTER_INSTALL}" in
+    0|1) ;;
+    *) die "HASHCAKE_START_AFTER_INSTALL 只能是 0 或 1：${START_AFTER_INSTALL}" ;;
+  esac
+  case "${ALLOW_PRERELEASE}" in
+    0|1) ;;
+    *) die "HASHCAKE_ALLOW_PRERELEASE 只能是 0 或 1：${ALLOW_PRERELEASE}" ;;
+  esac
+  case "${RUST_LOG_VALUE}" in
+    ''|*[!A-Za-z0-9_=,.:/-]*) die "RUST_LOG 包含 systemd Environment 不支持的字符" ;;
+  esac
+  case "${UPDATE_MANIFEST_URL}" in
+    *[[:space:]]*) die "HASHCAKE_UPDATE_MANIFEST_URL 不能包含空白字符" ;;
+  esac
+  if [ -n "${UPDATE_MANIFEST_URL}" ]; then
+    case "${UPDATE_MANIFEST_URL}" in
+      https://*) ;;
+      *) die "HASHCAKE_UPDATE_MANIFEST_URL 必须使用 https://" ;;
+    esac
+    printf '%s' "${UPDATE_MANIFEST_URL}" | grep -Eq '^https://[A-Za-z0-9:/?&=._%+#~-]+$' \
+      || die "HASHCAKE_UPDATE_MANIFEST_URL 包含不安全字符"
+  fi
+  if [ -n "${HASHCAKE_DOWNLOAD_URL:-}" ]; then
+    case "${HASHCAKE_DOWNLOAD_URL}" in
+      https://*) ;;
+      *) die "HASHCAKE_DOWNLOAD_URL 必须使用 https://；本地文件请改用 HASHCAKE_BIN_SOURCE" ;;
+    esac
+    case "${HASHCAKE_DOWNLOAD_URL}" in
+      *[[:space:]]*) die "HASHCAKE_DOWNLOAD_URL 不能包含空白字符" ;;
+    esac
+  fi
+  if [ -n "${DOWNLOAD_SHA256}" ] \
+    && { [ "${#DOWNLOAD_SHA256}" -ne 64 ] || [[ "${DOWNLOAD_SHA256}" == *[!0-9A-Fa-f]* ]]; }; then
+    die "HASHCAKE_DOWNLOAD_SHA256 必须是 64 位十六进制 SHA-256"
+  fi
+
+  validate_safe_absolute_path "${INSTALL_DIR}" "安装目录"
+  validate_safe_absolute_path "${CONFIG_DIR}" "配置目录"
+  validate_safe_absolute_path "${CONFIG_FILE}" "配置文件"
+  validate_safe_absolute_path "${STATE_DIR}" "状态目录"
+  validate_safe_absolute_path "${LOG_DIR}" "日志目录"
+  validate_safe_absolute_path "${BACKUP_DIR}" "备份目录"
+  validate_safe_absolute_path "${INSTALLER_STATE_DIR}" "安装元数据目录"
+}
+
+preflight_install_or_update() {
+  require_bash_runtime
+  need_root
+  [ "$(uname -s)" = "Linux" ] || die "一键安装器只支持 Linux，当前系统是 $(uname -s)"
+  reject_space_path
+  validate_runtime_inputs
+  local command_name
+  for command_name in awk chmod chown cp dirname getent grep groupadd install mktemp mv od pgrep python3 rm runuser sed sleep sort stat systemctl tail tr useradd wc; do
+    require_command "${command_name}"
+  done
+  if [ -z "${HASHCAKE_BIN_SOURCE:-}" ]; then
+    require_command curl
+    if ! command_exists sha256sum && ! command_exists shasum; then
+      die "缺少 sha256sum 或 shasum，无法校验下载文件"
+    fi
+  fi
+  has_systemd || die "当前系统没有可用 systemd，无法安全安装 HashCake 服务"
+  require_hardened_systemd
+  acquire_installer_lock
+}
+
 reject_space_path() {
-  case "${INSTALL_DIR}${CONFIG_FILE}${STATE_DIR}${LOG_DIR}${BACKUP_DIR}${INSTALLER_STATE_DIR}" in
+  case "${INSTALL_DIR}${CONFIG_DIR}${CONFIG_FILE}${STATE_DIR}${LOG_DIR}${BACKUP_DIR}${INSTALLER_STATE_DIR}" in
     *[[:space:]]*) die "安装路径不能包含空格：${INSTALL_DIR}" ;;
   esac
 }
@@ -78,10 +216,15 @@ ensure_service_user() {
 }
 
 run_as_service_user() {
-  if [ "$(id -u)" = "$(id -u "${SERVICE_USER}")" ]; then
+  local current_uid service_uid
+  current_uid="$(id -u)"
+  service_uid="$(id -u "${SERVICE_USER}" 2>/dev/null)" \
+    || die "服务用户不存在：${SERVICE_USER}"
+  if [ "${current_uid}" = "${service_uid}" ]; then
     "$@"
     return
   fi
+  [ "${current_uid}" = "0" ] || die "该操作需要 root 或 ${SERVICE_USER} 用户权限"
   command -v runuser >/dev/null 2>&1 || die "缺少 runuser，无法以 ${SERVICE_USER} 身份安全写入运行状态"
   runuser -u "${SERVICE_USER}" -- "$@"
 }
@@ -114,7 +257,9 @@ normalize_url_prefix() {
     *[!a-z0-9-]*|*/*|*.*|*_*) die "安全访问路径只能包含小写字母、数字和连字符：${raw}" ;;
     -*|*-) die "安全访问路径不能以连字符开头或结尾：${raw}" ;;
   esac
-  [ "${#raw}" -ge 2 ] && [ "${#raw}" -le 32 ] || die "安全访问路径长度必须是 2-32 位：${raw}"
+  if [ "${#raw}" -lt 2 ] || [ "${#raw}" -gt 32 ]; then
+    die "安全访问路径长度必须是 2-32 位：${raw}"
+  fi
   case "${raw}" in
     api|assets|admin|static|openapi.json|favicon.svg|index.html) die "安全访问路径不能使用保留名称：${raw}" ;;
   esac
@@ -122,6 +267,20 @@ normalize_url_prefix() {
 }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+ipv6_stack_available() {
+  [ "$(uname -s)" != "Linux" ] || [ -s /proc/net/if_inet6 ]
+}
+
+trim_whitespace() {
+  printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+count_csv_items() {
+  printf '%s\n' "$1" \
+    | tr ',' '\n' \
+    | awk 'NF { count += 1 } END { print count + 0 }'
+}
 
 port_in_use() {
   local port="$1"
@@ -131,15 +290,45 @@ port_in_use() {
     lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1 && return 0
   elif command_exists netstat; then
     netstat -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${port}$" && return 0
+  elif command_exists python3; then
+    python3 - "${port}" <<'PY'
+import errno
+import socket
+import sys
+
+port = int(sys.argv[1])
+for family, address in (
+    (socket.AF_INET, ("0.0.0.0", port)),
+    (socket.AF_INET6, ("::", port)),
+):
+    try:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+    except OSError:
+        continue
+    try:
+        sock.bind(address)
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            raise SystemExit(0)
+    finally:
+        sock.close()
+raise SystemExit(1)
+PY
+    return $?
   fi
   return 1
 }
 
 random_port() {
-  local min="${WEB_PORT_MIN}" max="${WEB_PORT_MAX}" span port i rand
-  [ "${min}" -ge 1 ] && [ "${max}" -le 65535 ] && [ "${min}" -le "${max}" ] || die "端口范围无效：${min}-${max}"
+  local min="${WEB_PORT_MIN}" max="${WEB_PORT_MAX}" span port attempt rand
+  case "${min}:${max}" in
+    *[!0-9:]*) die "端口范围必须是数字：${min}-${max}" ;;
+  esac
+  if [ "${min}" -lt 1 ] || [ "${max}" -gt 65535 ] || [ "${min}" -gt "${max}" ]; then
+    die "端口范围无效：${min}-${max}"
+  fi
   span=$((max - min + 1))
-  for i in $(seq 1 200); do
+  for ((attempt = 0; attempt < 200; attempt += 1)); do
     if command_exists od; then
       rand="$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
     else
@@ -159,11 +348,14 @@ validate_port_value() {
   case "${port}" in
     ''|*[!0-9]*) die "端口必须是数字：${port}" ;;
   esac
-  [ "${port}" -ge 1 ] && [ "${port}" -le 65535 ] || die "端口必须在 1-65535 范围内：${port}"
+  if [ "${port}" -lt 1 ] || [ "${port}" -gt 65535 ]; then
+    die "端口必须在 1-65535 范围内：${port}"
+  fi
 }
 
 validate_admin_bind_for_install() {
   local port
+  validate_saved_admin_bind "${ADMIN_BIND}"
   port="$(bind_port "${ADMIN_BIND}")"
   validate_port_value "${port}"
   if port_in_use "${port}"; then
@@ -217,14 +409,36 @@ decode_install_env_value() {
 }
 
 validate_saved_admin_bind() {
-  local value="$1" port
+  local value="$1" host port
   [ -n "${value}" ] || return 0
   case "${value}" in
-    *[!A-Za-z0-9.:[\]_-]*) die "安装元数据中的管理后台监听地址不安全：${value}" ;;
+    \[*\]:[0-9]*)
+      host="${value%%]:*}"
+      host="${host#\[}"
+      ;;
+    *:* )
+      host="${value%:*}"
+      case "${host}" in
+        *:*) die "IPv6 监听地址必须使用 [地址]:端口 格式：${value}" ;;
+      esac
+      ;;
+    *) die "管理后台监听地址必须使用 IP:端口 格式：${value}" ;;
   esac
   port="$(bind_port "${value}")"
   validate_port_value "${port}"
-  [ -n "$(host_from_bind "${value}")" ] || die "安装元数据中的管理后台监听主机为空"
+  [ -n "${host}" ] || die "安装元数据中的管理后台监听主机为空"
+  python3 - "${host}" <<'PY' || die "管理后台监听主机必须是 IPv4 或 IPv6 地址：${value}"
+import ipaddress
+import sys
+
+try:
+    ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+PY
+  case "${host}" in
+    *:*) ipv6_stack_available || die "系统未启用 IPv6，不能监听 ${value}" ;;
+  esac
 }
 
 validate_saved_https() {
@@ -422,12 +636,54 @@ except BaseException:
 PY
 }
 
+admin_store_state() {
+  command_exists python3 || die "缺少 python3，无法检查 ${STATE_DIR}/admin.json"
+  local admin_json="${STATE_DIR}/admin.json"
+  if [ ! -e "${admin_json}" ] && [ ! -L "${admin_json}" ]; then
+    printf 'missing'
+    return 0
+  fi
+  [ ! -L "${admin_json}" ] || die "后台状态文件不能是符号链接：${admin_json}"
+  [ -f "${admin_json}" ] || die "后台状态路径不是普通文件：${admin_json}"
+  python3 - "${admin_json}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as fh:
+    raw = fh.read()
+if not raw.strip():
+    data = {}
+else:
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"malformed admin state {path}: {exc}")
+if not isinstance(data, dict):
+    raise SystemExit(f"admin state root is not an object: {path}")
+
+tokens = data.get("tokens", [])
+accounts = data.get("accounts", [])
+if not isinstance(tokens, list):
+    raise SystemExit(f"admin state tokens is not an array: {path}")
+if not isinstance(accounts, list):
+    raise SystemExit(f"admin state accounts is not an array: {path}")
+legacy_hash = data.get("active_hash_sha256_hex")
+has_legacy_token = isinstance(legacy_hash, str) and bool(legacy_hash.strip())
+print("provisioned" if tokens or accounts or has_legacy_token else "uninitialized", end="")
+PY
+}
+
 is_installed() {
   [ -x "${BIN_PATH}" ] || [ -f "${SERVICE_FILE}" ] || [ -f "${INSTALL_ENV}" ] || [ -f "${LEGACY_INSTALL_ENV}" ]
 }
 
+is_complete_install() {
+  [ -x "${BIN_PATH}" ] && [ -f "${SERVICE_FILE}" ]
+}
+
 running_processes() {
-  pgrep -af "${BIN_PATH}|(^|/)hashcake( |$)" 2>/dev/null || true
+  pgrep -af '(^|/)hashcake( |$)' 2>/dev/null || true
 }
 
 check_no_running_conflict() {
@@ -461,6 +717,142 @@ firewall_unit_list() {
 
 FIREWALL_SNAPSHOT_DIR=""
 FIREWALL_ROLLBACK_ARMED=0
+INSTALL_TRANSACTION_ACTIVE=0
+INSTALL_TRANSACTION_DIR=""
+TXN_HAD_BINARY=0
+TXN_HAD_SERVICE=0
+TXN_HAD_INSTALL_ENV=0
+TXN_HAD_LEGACY_INSTALL_ENV=0
+TXN_HAD_ADMIN_JSON=0
+TXN_HAD_CONFIG=0
+TXN_SERVICE_WAS_ENABLED=0
+TXN_SERVICE_WAS_ACTIVE=0
+TXN_BINARY_CHANGED=0
+TXN_SERVICE_CHANGED=0
+
+backup_transaction_file() {
+  local path="$1" name="$2" flag_name="$3"
+  if [ -e "${path}" ] || [ -L "${path}" ]; then
+    [ ! -L "${path}" ] || die "事务备份拒绝符号链接：${path}"
+    [ -f "${path}" ] || die "事务备份目标不是普通文件：${path}"
+    cp -p -- "${path}" "${INSTALL_TRANSACTION_DIR}/${name}"
+    printf -v "${flag_name}" '%s' 1
+  fi
+}
+
+restore_transaction_file() {
+  local path="$1" name="$2" existed="$3"
+  if [ "${existed}" = "1" ]; then
+    cp -p -- "${INSTALL_TRANSACTION_DIR}/${name}" "${path}" \
+      || { warn "无法恢复 ${path}"; return 1; }
+  else
+    rm -f -- "${path}" || return 1
+  fi
+}
+
+begin_install_transaction() {
+  [ "${INSTALL_TRANSACTION_ACTIVE}" = "0" ] || die "安装事务已经启动"
+  TXN_HAD_BINARY=0
+  TXN_HAD_SERVICE=0
+  TXN_HAD_INSTALL_ENV=0
+  TXN_HAD_LEGACY_INSTALL_ENV=0
+  TXN_HAD_ADMIN_JSON=0
+  TXN_HAD_CONFIG=0
+  TXN_SERVICE_WAS_ENABLED=0
+  TXN_SERVICE_WAS_ACTIVE=0
+  TXN_BINARY_CHANGED=0
+  TXN_SERVICE_CHANGED=0
+  INSTALL_TRANSACTION_DIR="$(mktemp -d "${BACKUP_DIR}/.install-transaction.XXXXXX")"
+  chmod 700 "${INSTALL_TRANSACTION_DIR}"
+
+  backup_transaction_file "${BIN_PATH}" binary TXN_HAD_BINARY
+  backup_transaction_file "${SERVICE_FILE}" service TXN_HAD_SERVICE
+  backup_transaction_file "${INSTALL_ENV}" install-env TXN_HAD_INSTALL_ENV
+  backup_transaction_file "${LEGACY_INSTALL_ENV}" legacy-install-env TXN_HAD_LEGACY_INSTALL_ENV
+  backup_transaction_file "${STATE_DIR}/admin.json" admin-json TXN_HAD_ADMIN_JSON
+  backup_transaction_file "${CONFIG_FILE}" config TXN_HAD_CONFIG
+
+  if has_systemd && systemctl is-enabled --quiet "${SERVICE_NAME}.service" 2>/dev/null; then
+    TXN_SERVICE_WAS_ENABLED=1
+  fi
+  if has_systemd && systemctl is-active --quiet "${SERVICE_NAME}.service" 2>/dev/null; then
+    TXN_SERVICE_WAS_ACTIVE=1
+  fi
+  INSTALL_TRANSACTION_ACTIVE=1
+  trap 'install_exit_guard "$?"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
+cleanup_install_transaction() {
+  if [ -n "${INSTALL_TRANSACTION_DIR}" ]; then
+    rm -rf -- "${INSTALL_TRANSACTION_DIR}"
+    INSTALL_TRANSACTION_DIR=""
+  fi
+}
+
+rollback_install_transaction() {
+  local failed=0
+  [ "${INSTALL_TRANSACTION_ACTIVE}" = "1" ] || return 0
+  warn "安装或更新未完成，正在恢复执行前状态"
+
+  if [ "${FIREWALL_ROLLBACK_ARMED}" = "1" ]; then
+    restore_firewall_state || failed=1
+    FIREWALL_ROLLBACK_ARMED=0
+  fi
+  if has_systemd && { [ "${TXN_BINARY_CHANGED}" = "1" ] || [ "${TXN_SERVICE_CHANGED}" = "1" ]; }; then
+    systemctl stop "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
+  fi
+
+  restore_transaction_file "${BIN_PATH}" binary "${TXN_HAD_BINARY}" || failed=1
+  restore_transaction_file "${SERVICE_FILE}" service "${TXN_HAD_SERVICE}" || failed=1
+  restore_transaction_file "${INSTALL_ENV}" install-env "${TXN_HAD_INSTALL_ENV}" || failed=1
+  restore_transaction_file "${LEGACY_INSTALL_ENV}" legacy-install-env "${TXN_HAD_LEGACY_INSTALL_ENV}" || failed=1
+  restore_transaction_file "${STATE_DIR}/admin.json" admin-json "${TXN_HAD_ADMIN_JSON}" || failed=1
+  restore_transaction_file "${CONFIG_FILE}" config "${TXN_HAD_CONFIG}" || failed=1
+
+  if has_systemd; then
+    systemctl daemon-reload >/dev/null 2>&1 || failed=1
+    if [ "${TXN_SERVICE_WAS_ENABLED}" = "1" ]; then
+      systemctl enable "${SERVICE_NAME}.service" >/dev/null 2>&1 || failed=1
+    else
+      systemctl disable "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
+    fi
+    if [ "${TXN_SERVICE_WAS_ACTIVE}" = "1" ]; then
+      if ! restart_service_checked >/dev/null 2>&1; then
+        warn "已恢复旧文件，但 ${SERVICE_NAME}.service 未能稳定恢复运行"
+        failed=1
+      fi
+    fi
+  fi
+
+  cleanup_firewall_snapshot
+  cleanup_install_transaction
+  INSTALL_TRANSACTION_ACTIVE=0
+  if [ "${failed}" = "0" ]; then
+    ok "已恢复执行前的二进制、服务和安装配置"
+  else
+    warn "自动恢复不完整，请检查 ${BIN_PATH} 和 ${SERVICE_FILE}"
+  fi
+}
+
+commit_install_transaction() {
+  [ "${INSTALL_TRANSACTION_ACTIVE}" = "1" ] || die "没有可提交的安装事务"
+  if [ "${FIREWALL_ROLLBACK_ARMED}" = "1" ]; then
+    commit_firewall_change
+  fi
+  INSTALL_TRANSACTION_ACTIVE=0
+  cleanup_install_transaction
+  trap - EXIT INT TERM
+}
+
+install_exit_guard() {
+  local status="$1"
+  trap - EXIT INT TERM
+  rollback_install_transaction || true
+  [ "${status}" -ne 0 ] || status=1
+  exit "${status}"
+}
 
 capture_firewall_state() {
   local unit enabled active
@@ -472,6 +864,16 @@ capture_firewall_state() {
 
   if command_exists ufw && ufw status 2>/dev/null | grep -Eiq '^Status:[[:space:]]*active'; then
     : > "${FIREWALL_SNAPSHOT_DIR}/ufw-active"
+  fi
+  if command_exists iptables-save; then
+    iptables-save > "${FIREWALL_SNAPSHOT_DIR}/iptables.before" \
+      || die "无法备份当前 iptables 规则，防火墙尚未修改"
+    chmod 600 "${FIREWALL_SNAPSHOT_DIR}/iptables.before"
+  fi
+  if ipv6_stack_available && command_exists ip6tables-save; then
+    ip6tables-save > "${FIREWALL_SNAPSHOT_DIR}/ip6tables.before" \
+      || die "无法备份当前 ip6tables 规则，防火墙尚未修改"
+    chmod 600 "${FIREWALL_SNAPSHOT_DIR}/ip6tables.before"
   fi
 
   while IFS= read -r unit; do
@@ -518,6 +920,21 @@ restore_firewall_state() {
     esac
   done < "${FIREWALL_SNAPSHOT_DIR}/units.tsv"
 
+  if [ -f "${FIREWALL_SNAPSHOT_DIR}/iptables.before" ]; then
+    if command_exists iptables-restore; then
+      iptables-restore < "${FIREWALL_SNAPSHOT_DIR}/iptables.before" || failed=1
+    else
+      failed=1
+    fi
+  fi
+  if [ -f "${FIREWALL_SNAPSHOT_DIR}/ip6tables.before" ]; then
+    if command_exists ip6tables-restore; then
+      ip6tables-restore < "${FIREWALL_SNAPSHOT_DIR}/ip6tables.before" || failed=1
+    else
+      failed=1
+    fi
+  fi
+
   if [ "${failed}" = "0" ]; then
     ok "已恢复安装前的防火墙状态"
   else
@@ -545,12 +962,16 @@ firewall_exit_guard() {
 arm_firewall_rollback() {
   capture_firewall_state
   FIREWALL_ROLLBACK_ARMED=1
-  trap 'firewall_exit_guard "$?"' EXIT
+  if [ "${INSTALL_TRANSACTION_ACTIVE}" != "1" ]; then
+    trap 'firewall_exit_guard "$?"' EXIT
+  fi
 }
 
 commit_firewall_change() {
   FIREWALL_ROLLBACK_ARMED=0
-  trap - EXIT
+  if [ "${INSTALL_TRANSACTION_ACTIVE}" != "1" ]; then
+    trap - EXIT
+  fi
   cleanup_firewall_snapshot
 }
 
@@ -705,8 +1126,20 @@ verify_firewall_disabled() {
     || die "仍检测到 nftables INPUT 的 drop/reject 规则；安装器不会谎报整机防火墙已关闭"
   iptables_input_filter_is_open iptables-save \
     || die "仍检测到 iptables INPUT 的 drop/reject 规则；安装器不会谎报整机防火墙已关闭"
-  iptables_input_filter_is_open ip6tables-save \
-    || die "仍检测到 ip6tables INPUT 的 drop/reject 规则；安装器不会谎报整机防火墙已关闭"
+  if ipv6_stack_available; then
+    iptables_input_filter_is_open ip6tables-save \
+      || die "仍检测到 ip6tables INPUT 的 drop/reject 规则；安装器不会谎报整机防火墙已关闭"
+  fi
+}
+
+open_iptables_input_filter() {
+  local tool="$1"
+  command_exists "${tool}" || return 1
+  "${tool}" -w 5 -P INPUT ACCEPT >/dev/null 2>&1 \
+    || die "无法把 ${tool} INPUT 默认策略改为 ACCEPT；安装已停止"
+  "${tool}" -w 5 -F INPUT >/dev/null 2>&1 \
+    || die "无法清空 ${tool} INPUT 规则；安装已停止"
+  ok "已放行 ${tool} INPUT 链"
 }
 
 disable_firewall_now() {
@@ -737,6 +1170,15 @@ disable_firewall_now() {
     fi
   done < <(firewall_unit_list)
 
+  if command_exists iptables; then
+    detected=1
+    open_iptables_input_filter iptables
+  fi
+  if ipv6_stack_available && command_exists ip6tables; then
+    detected=1
+    open_iptables_input_filter ip6tables
+  fi
+
   if [ "${detected}" = "0" ]; then
     ok "未检测到常见主机防火墙服务，将继续核验 INPUT 是否完全放行"
   fi
@@ -745,6 +1187,8 @@ disable_firewall_now() {
 }
 
 disable_firewall() {
+  need_root
+  acquire_installer_lock
   arm_firewall_rollback
   disable_firewall_now
   commit_firewall_change
@@ -753,12 +1197,21 @@ disable_firewall() {
 public_ip() {
   local ip=""
   if command_exists curl; then
-    ip="$(curl -fsS --max-time 2 https://api.ipify.org 2>/dev/null || true)"
+    ip="$(curl -fsS --connect-timeout 2 --max-time 3 https://api.ipify.org 2>/dev/null || true)"
   fi
-  if [ -z "${ip}" ]; then
-    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  if [ -z "${ip}" ] && command_exists hostname; then
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
   fi
   printf '%s' "${ip:-服务器IP}"
+}
+
+format_url_host() {
+  local host="$1"
+  case "${host}" in
+    \[*\]) printf '%s' "${host}" ;;
+    *:*) printf '[%s]' "${host}" ;;
+    *) printf '%s' "${host}" ;;
+  esac
 }
 
 admin_url() {
@@ -767,37 +1220,171 @@ admin_url() {
   host="$(host_from_bind "${ADMIN_BIND}")"
   port="$(bind_port "${ADMIN_BIND}")"
   case "${host}" in 0.0.0.0|::|\[::\]|"") host="$(public_ip)" ;; esac
+  host="$(format_url_host "${host}")"
   printf '%s://%s:%s/%s/' "${scheme}" "${host}" "${port}" "${URL_PREFIX}"
 }
 
+bootstrap_admin_endpoint() {
+  local host port
+  host="$(host_from_bind "${ADMIN_BIND}")"
+  port="$(bind_port "${ADMIN_BIND}")"
+  case "${host}" in
+    0.0.0.0) host="127.0.0.1" ;;
+    ::|\[::\]) host="[::1]" ;;
+    *) host="$(format_url_host "${host}")" ;;
+  esac
+  printf 'http://%s:%s/api/v1/bootstrap/confirm' "${host}" "${port}"
+}
+
 extract_bootstrap_token() {
-  local file="${LOG_DIR}/hashcake.err.log"
+  local file="${LOG_DIR}/hashcake.err.log" start_line="${1:-1}"
   [ -f "${file}" ] || return 1
-  awk '/HashCake admin API bootstrap token/{getline; gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0); if ($0 != "") print $0}' "${file}" | tail -n 1
+  case "${start_line}" in
+    ''|*[!0-9]*|0) return 1 ;;
+  esac
+  tail -n "+${start_line}" -- "${file}" | awk '
+    /HashCake admin API bootstrap token/ { token = ""; capture = 1; remaining = 8; next }
+    capture && remaining > 0 {
+      remaining -= 1
+      line = $0
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+      if (line != "" && line !~ /^=+$/) {
+        token = line
+        capture = 0
+      }
+    }
+    END {
+      if (token != "") print token
+      else exit 1
+    }
+  '
+}
+
+wait_for_bootstrap_token() {
+  local start_line="${1:-1}" attempt token
+  for ((attempt = 0; attempt < 20; attempt += 1)); do
+    token="$(extract_bootstrap_token "${start_line}" || true)"
+    if [ -n "${token}" ]; then
+      printf '%s' "${token}"
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+confirm_initial_admin_token() {
+  local token="$1" endpoint
+  [ -n "${token}" ] || die "首次 Web访问令牌为空，无法完成后台初始化"
+  endpoint="$(bootstrap_admin_endpoint)"
+  python3 - "${endpoint}" 3<<<"${token}" <<'PY'
+import sys
+import time
+import urllib.error
+import urllib.request
+
+endpoint = sys.argv[1]
+with open(3, "r", encoding="utf-8", closefd=False) as token_fd:
+    token = token_fd.read().strip()
+if not token:
+    raise SystemExit("bootstrap token is empty")
+
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+last_error = "service did not respond"
+for _ in range(20):
+    request = urllib.request.Request(
+        endpoint,
+        data=b"",
+        method="POST",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with opener.open(request, timeout=2) as response:
+            if 200 <= response.status < 300:
+                raise SystemExit(0)
+            last_error = f"HTTP {response.status}"
+    except urllib.error.HTTPError as exc:
+        last_error = f"HTTP {exc.code}"
+        if exc.code in (400, 401, 403):
+            break
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        last_error = str(exc)
+    time.sleep(0.5)
+raise SystemExit(f"bootstrap confirmation failed: {last_error}")
+PY
 }
 
 github_api_get() {
   local url="$1"
+  local args=(--fail --silent --show-error --location --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 60)
   if [ -n "${GITHUB_TOKEN:-}" ]; then
-    curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" "${url}"
+    curl "${args[@]}" -H "Authorization: Bearer ${GITHUB_TOKEN}" "${url}"
   elif [ -n "${GH_TOKEN:-}" ]; then
-    curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" "${url}"
+    curl "${args[@]}" -H "Authorization: Bearer ${GH_TOKEN}" "${url}"
   else
-    curl -fsSL "${url}"
+    curl "${args[@]}" "${url}"
   fi
 }
 
 download_repo_file() {
   local path="$1"
   local dst="$2"
-  local url="https://api.github.com/repos/${RELEASE_REPO}/contents/${path}?ref=${RELEASE_BRANCH}"
+  local args=(--fail --silent --show-error --location --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 600)
+  local url
   if [ -n "${GITHUB_TOKEN:-}" ]; then
-    curl -fL -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github.raw" "${url}" -o "${dst}"
+    url="https://api.github.com/repos/${RELEASE_REPO}/contents/${path}?ref=${RELEASE_BRANCH}"
+    curl "${args[@]}" -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github.raw" "${url}" -o "${dst}"
   elif [ -n "${GH_TOKEN:-}" ]; then
-    curl -fL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github.raw" "${url}" -o "${dst}"
+    url="https://api.github.com/repos/${RELEASE_REPO}/contents/${path}?ref=${RELEASE_BRANCH}"
+    curl "${args[@]}" -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github.raw" "${url}" -o "${dst}"
   else
-    curl -fL -H "Accept: application/vnd.github.raw" "${url}" -o "${dst}"
+    url="https://api.github.com/repos/${RELEASE_REPO}/contents/${path}?ref=${RELEASE_BRANCH}"
+    curl "${args[@]}" -H "Accept: application/vnd.github.raw" "${url}" -o "${dst}"
   fi
+}
+
+download_url_file() {
+  local url="$1" dst="$2"
+  curl --fail --silent --show-error --location \
+    --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 600 \
+    "${url}" -o "${dst}"
+}
+
+sha256_file() {
+  local path="$1"
+  if command_exists sha256sum; then
+    sha256sum "${path}" | awk '{print tolower($1)}'
+  elif command_exists shasum; then
+    shasum -a 256 "${path}" | awk '{print tolower($1)}'
+  else
+    die "缺少 sha256sum 或 shasum，无法校验下载文件"
+  fi
+}
+
+verify_file_sha256() {
+  local path="$1" expected="$2" actual
+  expected="$(printf '%s' "${expected}" | tr 'A-F' 'a-f')"
+  actual="$(sha256_file "${path}")"
+  if [ "${actual}" != "${expected}" ]; then
+    printf '%s\n' "${red}错误:${reset} 下载文件 SHA-256 校验失败：期望 ${expected}，实际 ${actual}" >&2
+    return 1
+  fi
+  ok "下载文件 SHA-256 校验通过"
+}
+
+repo_asset_sha256() {
+  local asset_path="$1" sums_file expected
+  sums_file="$(mktemp "${INSTALL_DIR}/.SHA256SUMS.XXXXXX")"
+  if ! download_repo_file "SHA256SUMS" "${sums_file}"; then
+    rm -f -- "${sums_file}"
+    die "发布仓库缺少可下载的 SHA256SUMS，已拒绝安装未经校验的官方二进制"
+  fi
+  expected="$(awk -v wanted="${asset_path}" '$2 == wanted { print $1; exit }' "${sums_file}")"
+  rm -f -- "${sums_file}"
+  if [ "${#expected}" -ne 64 ] || [[ "${expected}" == *[!0-9A-Fa-f]* ]]; then
+    die "SHA256SUMS 中缺少 ${asset_path} 的有效校验值"
+  fi
+  printf '%s' "${expected}"
 }
 
 asset_name_for_version() {
@@ -807,14 +1394,66 @@ asset_name_for_version() {
     return
   fi
   command -v curl >/dev/null 2>&1 || die "缺少 curl，无法查询 latest Release"
-  local name
-  name="$(github_api_get "https://api.github.com/repos/${RELEASE_REPO}/contents/${RELEASE_PLATFORM}?ref=${RELEASE_BRANCH}" \
-    | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | grep -E "^${prefix}-[0-9][0-9A-Za-z._-]*-${RELEASE_PLATFORM}$" \
-    | sort -V \
-    | tail -n 1)"
+  local listing names name
+  listing="$(github_api_get "https://api.github.com/repos/${RELEASE_REPO}/contents/${RELEASE_PLATFORM}?ref=${RELEASE_BRANCH}")" \
+    || die "无法读取 ${RELEASE_REPO}/${RELEASE_PLATFORM} 发布目录"
+  if ! names="$(printf '%s' "${listing}" | python3 -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+if not isinstance(data, list):
+    raise SystemExit(1)
+for entry in data:
+    if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+        print(entry["name"])
+')"; then
+    die "GitHub 发布目录返回了无法识别的数据"
+  fi
+  if [ "${ALLOW_PRERELEASE}" = "1" ]; then
+    name="$(printf '%s\n' "${names}" \
+      | grep -E "^${prefix}-[0-9][0-9A-Za-z._-]*-${RELEASE_PLATFORM}$" \
+      | sort -V \
+      | tail -n 1)"
+  else
+    name="$(printf '%s\n' "${names}" \
+      | grep -E "^${prefix}-[0-9]+\.[0-9]+\.[0-9]+-${RELEASE_PLATFORM}$" \
+      | sort -V \
+      | tail -n 1)"
+  fi
   [ -n "${name}" ] || die "无法在 ${RELEASE_REPO}/${RELEASE_PLATFORM} 找到 ${prefix} 的发布文件；可改用 HASHCAKE_DOWNLOAD_URL"
   printf '%s' "${name}"
+}
+
+ensure_config_dir() {
+  local managed=0 owner_uid service_uid mode
+  [ "${CONFIG_DIR}" != "${INSTALL_DIR}" ] \
+    || die "配置文件必须放在独立子目录中，不能直接放在安装目录：${CONFIG_FILE}"
+  [ ! -L "${CONFIG_DIR}" ] || die "配置目录不能是符号链接：${CONFIG_DIR}"
+  case "${CONFIG_DIR}" in
+    "${INSTALL_DIR}/config") managed=1 ;;
+  esac
+
+  if [ ! -e "${CONFIG_DIR}" ]; then
+    validate_root_controlled_parent "${CONFIG_DIR}" "配置目录"
+    install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${CONFIG_DIR}"
+  fi
+  [ -d "${CONFIG_DIR}" ] || die "配置目录路径不是目录：${CONFIG_DIR}"
+
+  service_uid="$(id -u "${SERVICE_USER}")"
+  owner_uid="$(stat -c '%u' -- "${CONFIG_DIR}")"
+  if [ "${owner_uid}" != "${service_uid}" ]; then
+    if [ "${managed}" = "1" ]; then
+      chown "${SERVICE_USER}:${SERVICE_GROUP}" "${CONFIG_DIR}"
+    else
+      die "自定义配置目录必须属于 ${SERVICE_USER}，以便 Web 后台原子保存配置：${CONFIG_DIR}"
+    fi
+  fi
+  mode="$(stat -c '%a' -- "${CONFIG_DIR}")"
+  if [ $((8#${mode} & 8#002)) -ne 0 ]; then
+    die "配置目录不能被其他用户写入：${CONFIG_DIR}"
+  fi
+  chmod 750 "${CONFIG_DIR}"
 }
 
 ensure_dirs() {
@@ -830,6 +1469,7 @@ ensure_dirs() {
   chmod 700 "${STATE_DIR}" "${LOG_DIR}" "${BACKUP_DIR}"
   chown root:root "${INSTALL_DIR}" "${BACKUP_DIR}"
   chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${STATE_DIR}" "${LOG_DIR}"
+  ensure_config_dir
   ensure_installer_state_dir
 }
 
@@ -907,7 +1547,9 @@ YAML
 }
 
 install_config() {
-  validate_root_controlled_parent "${CONFIG_FILE}" "配置文件"
+  [ "$(dirname -- "${CONFIG_FILE}")" = "${CONFIG_DIR}" ] \
+    || die "配置目录与配置文件路径不一致：${CONFIG_FILE}"
+  ensure_config_dir
   [ ! -L "${CONFIG_FILE}" ] || die "配置文件不能是符号链接：${CONFIG_FILE}"
   if [ -e "${CONFIG_FILE}" ] && [ ! -f "${CONFIG_FILE}" ]; then
     die "配置文件路径不是普通文件：${CONFIG_FILE}"
@@ -919,7 +1561,12 @@ install_config() {
     return
   fi
 
-  if [ -f "${SOURCE_ROOT}/hashcake.yaml" ]; then
+  if [ "${CONFIG_FILE}" = "${INSTALL_DIR}/config/hashcake.yaml" ] && [ -f "${LEGACY_CONFIG_FILE}" ]; then
+    [ ! -L "${LEGACY_CONFIG_FILE}" ] || die "旧配置文件不能是符号链接：${LEGACY_CONFIG_FILE}"
+    install -m 0600 "${LEGACY_CONFIG_FILE}" "${CONFIG_FILE}"
+    ok "已把旧配置迁移到可由 Web 后台安全保存的新目录 ${CONFIG_FILE}"
+    warn "旧配置 ${LEGACY_CONFIG_FILE} 仅保留为备份；后续请编辑新路径"
+  elif [ -f "${SOURCE_ROOT}/hashcake.yaml" ]; then
     install -m 0600 "${SOURCE_ROOT}/hashcake.yaml" "${CONFIG_FILE}"
     ok "已复制配置到 ${CONFIG_FILE}"
   else
@@ -960,7 +1607,7 @@ build_hashcake() {
 }
 
 download_hashcake() {
-  local dst="$1"
+  local dst="$1" download_path="${1}.download" expected_sha=""
   local url="${HASHCAKE_DOWNLOAD_URL:-}"
   command -v curl >/dev/null 2>&1 || die "缺少 curl，无法下载 HASHCAKE_DOWNLOAD_URL"
   if [ -z "${url}" ]; then
@@ -969,23 +1616,49 @@ download_hashcake() {
       *) return 1 ;;
     esac
     local asset
-    asset="$(asset_name_for_version hashcake)"
+    if ! asset="$(asset_name_for_version hashcake)"; then
+      die "无法确定要安装的 HashCake 发布文件"
+    fi
+    EXPECTED_BINARY_VERSION="${asset#hashcake-}"
+    EXPECTED_BINARY_VERSION="${EXPECTED_BINARY_VERSION%-"${RELEASE_PLATFORM}"}"
     log "下载 hashcake 二进制：github.com/${RELEASE_REPO}/${RELEASE_PLATFORM}/${asset}"
-    download_repo_file "${RELEASE_PLATFORM}/${asset}" "${dst}.download" \
-      || die "下载 HashCake 发布文件失败"
+    if ! download_repo_file "${RELEASE_PLATFORM}/${asset}" "${download_path}"; then
+      rm -f -- "${download_path}"
+      die "下载 HashCake 发布文件失败"
+    fi
+    if ! expected_sha="$(repo_asset_sha256 "${RELEASE_PLATFORM}/${asset}")"; then
+      rm -f -- "${download_path}"
+      die "无法取得 HashCake 发布文件的 SHA-256 校验值"
+    fi
   else
-    log "下载 hashcake 二进制：${url}"
-    curl -fL "${url}" -o "${dst}.download" \
-      || die "下载 HASHCAKE_DOWNLOAD_URL 失败"
+    log "从自定义 HASHCAKE_DOWNLOAD_URL 下载 hashcake 二进制（地址已隐藏）"
+    if ! download_url_file "${url}" "${download_path}"; then
+      rm -f -- "${download_path}"
+      die "下载 HASHCAKE_DOWNLOAD_URL 失败"
+    fi
+    expected_sha="${DOWNLOAD_SHA256}"
+    if [ -z "${expected_sha}" ]; then
+      warn "自定义 HASHCAKE_DOWNLOAD_URL 未提供 HASHCAKE_DOWNLOAD_SHA256，只能执行二进制启动检查"
+    fi
   fi
-  install -m 0755 "${dst}.download" "${dst}" \
-    || die "无法准备 HashCake 候选二进制"
-  rm -f "${dst}.download"
+  if [ -n "${expected_sha}" ] && ! verify_file_sha256 "${download_path}" "${expected_sha}"; then
+    rm -f -- "${download_path}"
+    die "HashCake 下载文件校验失败，候选文件已删除"
+  fi
+  if ! install -m 0755 "${download_path}" "${dst}"; then
+    rm -f -- "${download_path}"
+    die "无法准备 HashCake 候选二进制"
+  fi
+  rm -f -- "${download_path}"
   return 0
 }
 
 install_binary() {
-  local src="${HASHCAKE_BIN_SOURCE:-}" candidate source_label
+  local src="${HASHCAKE_BIN_SOURCE:-}" candidate source_label version_output actual_version
+  EXPECTED_BINARY_VERSION=""
+  if [ "${RELEASE_TAG}" != "latest" ]; then
+    EXPECTED_BINARY_VERSION="${RELEASE_TAG#v}"
+  fi
   validate_root_controlled_parent "${BIN_PATH}" "HashCake 二进制"
   [ ! -L "${BIN_PATH}" ] || die "HashCake 二进制不能是符号链接：${BIN_PATH}"
   if [ -e "${BIN_PATH}" ] && [ ! -f "${BIN_PATH}" ]; then
@@ -1008,25 +1681,47 @@ install_binary() {
 
   chown root:root "${candidate}"
   if command_exists timeout; then
-    run_as_service_user timeout 15 "${candidate}" --version >/dev/null 2>&1 \
-      || { rm -f -- "${candidate}"; die "HashCake 候选二进制无法正常执行，防火墙尚未修改"; }
+    if ! version_output="$(run_as_service_user timeout 15 "${candidate}" --version 2>&1)"; then
+      rm -f -- "${candidate}"
+      die "HashCake 候选二进制无法正常执行，防火墙尚未修改。原始错误：
+${version_output:-未返回错误详情。请检查 CPU 架构和 GLIBC 版本。}"
+    fi
   else
-    run_as_service_user "${candidate}" --version >/dev/null 2>&1 \
-      || { rm -f -- "${candidate}"; die "HashCake 候选二进制无法正常执行，防火墙尚未修改"; }
+    if ! version_output="$(run_as_service_user "${candidate}" --version 2>&1)"; then
+      rm -f -- "${candidate}"
+      die "HashCake 候选二进制无法正常执行，防火墙尚未修改。原始错误：
+${version_output:-未返回错误详情。请检查 CPU 架构和 GLIBC 版本。}"
+    fi
+  fi
+  [ -n "${version_output}" ] \
+    || { rm -f -- "${candidate}"; die "HashCake 候选二进制执行成功但没有返回版本号"; }
+  actual_version="$(printf '%s\n' "${version_output}" | awk 'NR == 1 { print $NF }')"
+  if [ -n "${EXPECTED_BINARY_VERSION}" ] && [ "${actual_version}" != "${EXPECTED_BINARY_VERSION}" ]; then
+    rm -f -- "${candidate}"
+    die "HashCake 候选二进制版本不匹配：期望 ${EXPECTED_BINARY_VERSION}，实际 ${actual_version:-未知}"
   fi
   mv -fT "${candidate}" "${BIN_PATH}"
+  TXN_BINARY_CHANGED=1
   chmod 755 "${BIN_PATH}"
   chown root:root "${BIN_PATH}"
-  ok "已原子安装${source_label} ${BIN_PATH}"
+  ok "已原子安装${source_label} ${BIN_PATH}（${version_output}）"
 }
 
 write_service() {
+  local persist_security_now="${1:-1}"
   need_root
   has_systemd || die "当前系统没有可用 systemd，暂不写入服务"
   require_hardened_systemd
+  case "${persist_security_now}" in
+    0|1) ;;
+    *) die "write_service 的安全配置写入参数只能是 0 或 1" ;;
+  esac
   [ -n "${ADMIN_BIND}" ] || die "管理后台监听地址为空"
+  validate_saved_admin_bind "${ADMIN_BIND}"
   URL_PREFIX="$(normalize_url_prefix "${URL_PREFIX}")"
-  persist_admin_security
+  if [ "${persist_security_now}" = "1" ]; then
+    persist_admin_security
+  fi
   save_install_env
   chown "${SERVICE_USER}:${SERVICE_GROUP}" "${CONFIG_FILE}"
   validate_root_controlled_parent "${SERVICE_FILE}" "systemd 服务文件"
@@ -1035,14 +1730,18 @@ write_service() {
     die "systemd 服务路径不是普通文件：${SERVICE_FILE}"
   fi
 
-  local admin_args=""
+  local admin_args="" service_tmp
   if [ "${ADMIN_BIND}" != "off" ] && [ -n "${ADMIN_BIND}" ]; then
     admin_args=" --admin-bind ${ADMIN_BIND} --admin-token-store ${STATE_DIR}/admin.json --admin-audit-db ${STATE_DIR}/admin-audit.sqlite --metrics-token-file ${STATE_DIR}/metrics-token"
   fi
-  local update_args=""
-  [ -n "${UPDATE_MANIFEST_URL}" ] && update_args=" --update-manifest-url ${UPDATE_MANIFEST_URL}"
+  local update_args="" unit_update_url
+  if [ -n "${UPDATE_MANIFEST_URL}" ]; then
+    unit_update_url="${UPDATE_MANIFEST_URL//%/%%}"
+    update_args=" --update-manifest-url ${unit_update_url}"
+  fi
 
-  cat > "${SERVICE_FILE}" <<EOF
+  service_tmp="$(mktemp "/etc/systemd/system/.${SERVICE_NAME}.XXXXXX.service")"
+  cat > "${service_tmp}" <<EOF
 [Unit]
 Description=HashCake Stratum Proxy
 After=network-online.target
@@ -1055,7 +1754,7 @@ Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
 WorkingDirectory=${INSTALL_DIR}
-Environment=RUST_LOG=${RUST_LOG_VALUE}
+Environment="RUST_LOG=${RUST_LOG_VALUE}"
 ExecStart=${BIN_PATH} --config ${CONFIG_FILE} --no-tui --token-store ${STATE_DIR}/tokens.json --log-dir ${LOG_DIR} --log-file-prefix hashcake-debug.log${admin_args}${update_args}
 Restart=always
 RestartSec=2
@@ -1085,24 +1784,29 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 ReadOnlyPaths=${BIN_PATH}
-ReadWritePaths=${CONFIG_FILE} ${STATE_DIR} ${LOG_DIR}
+ReadWritePaths=${CONFIG_DIR} ${STATE_DIR} ${LOG_DIR}
 StandardOutput=append:${LOG_DIR}/hashcake.service.log
 StandardError=append:${LOG_DIR}/hashcake.err.log
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
+  chmod 644 "${service_tmp}"
+  chown root:root "${service_tmp}"
   if command_exists systemd-analyze; then
-    systemd-analyze verify "${SERVICE_FILE}" >/dev/null \
-      || die "systemd 服务校验失败，防火墙尚未修改"
+    if ! systemd-analyze verify "${service_tmp}" >/dev/null; then
+      rm -f -- "${service_tmp}"
+      die "systemd 服务校验失败，防火墙尚未修改"
+    fi
   fi
+  mv -fT "${service_tmp}" "${SERVICE_FILE}"
+  TXN_SERVICE_CHANGED=1
+  systemctl daemon-reload
   ok "已写入 systemd 服务 ${SERVICE_FILE}"
 }
 
 print_install_result() {
-  local token=""
-  token="$(extract_bootstrap_token || true)"
+  local token="${FIRST_WEB_TOKEN:-}"
   cat <<EOF
 
 ========== HashCake 安装结果 ==========
@@ -1116,13 +1820,11 @@ EOF
   if [ -n "${token}" ]; then
     cat <<EOF
 首次 Web访问令牌: ${token}
-有效期: 10 分钟
+有效期: 已确认为长期管理员令牌，请立即保存并妥善保管
 EOF
   else
     cat <<EOF
-首次 Web访问令牌: 暂未从日志提取到
-查看位置: ${LOG_DIR}/hashcake.err.log
-有效期: 服务首次启动后 10 分钟
+首次 Web访问令牌: 未生成新令牌（已沿用现有管理员凭据）
 EOF
   fi
   cat <<EOF
@@ -1136,38 +1838,67 @@ EOF
 }
 
 install_service() {
-  need_root
-  reject_space_path
-  has_systemd || die "当前系统没有可用 systemd，无法安全安装 HashCake 服务"
-  require_hardened_systemd
-  is_installed && die "检测到已安装 HashCake，请使用 update 更新程序"
+  local admin_state needs_bootstrap=0 bootstrap_log_start=1 token=""
+  preflight_install_or_update
+  if is_complete_install; then
+    die "检测到已安装 HashCake，请使用 update 更新程序"
+  fi
+  if is_installed; then
+    warn "检测到上次未完成的安装文件，将在事务保护下继续修复首次安装"
+  fi
   check_no_running_conflict
   ensure_dirs
+  begin_install_transaction
   configure_web_defaults_for_install
   validate_admin_bind_for_install
   ensure_metrics_token
   install_config
   install_binary
-  write_service
+  admin_state="$(admin_store_state)"
+  case "${admin_state}" in
+    missing|uninitialized)
+      needs_bootstrap=1
+      rm -f -- "${STATE_DIR}/admin.json"
+      write_service 0
+      ;;
+    provisioned) write_service ;;
+    *) die "无法识别后台状态：${admin_state}" ;;
+  esac
   systemctl enable "${SERVICE_NAME}.service"
   arm_firewall_rollback
   disable_firewall_now
+  if [ "${needs_bootstrap}" = "1" ]; then
+    if [ -f "${LOG_DIR}/hashcake.err.log" ]; then
+      bootstrap_log_start=$(( $(wc -l < "${LOG_DIR}/hashcake.err.log") + 1 ))
+    fi
+    log "首次启动 HashCake 并初始化 Web 管理员令牌"
+    if ! restart_service_checked; then
+      systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
+      die "${SERVICE_NAME}.service 首次启动失败或未能稳定运行"
+    fi
+    token="$(wait_for_bootstrap_token "${bootstrap_log_start}")" \
+      || die "服务已启动，但未能从本次启动日志提取首次 Web访问令牌"
+    confirm_initial_admin_token "${token}" \
+      || die "首次 Web访问令牌自动确认失败"
+    FIRST_WEB_TOKEN="${token}"
+    persist_admin_security
+    ok "已确认首次 Web访问令牌并写入最终 HTTPS 与安全访问路径"
+  fi
   if [ "${START_AFTER_INSTALL}" = "1" ]; then
     restart_service
   else
+    stop_service
     ok "已安装，未自动启动"
   fi
-  commit_firewall_change
+  commit_install_transaction
   print_install_result
 }
 
 update_service() {
-  need_root
-  reject_space_path
-  has_systemd || die "当前系统没有可用 systemd，无法安全更新 HashCake 服务"
-  require_hardened_systemd
+  preflight_install_or_update
   is_installed || die "未检测到已安装 HashCake，请先执行 install 首次安装"
   ensure_dirs
+  begin_install_transaction
   configure_web_defaults_for_update
   ensure_metrics_token
   install_config
@@ -1179,9 +1910,10 @@ update_service() {
   if [ "${START_AFTER_INSTALL}" = "1" ]; then
     restart_service
   else
+    stop_service
     ok "已更新，未自动启动"
   fi
-  commit_firewall_change
+  commit_install_transaction
   cat <<EOF
 
 ========== HashCake 更新结果 ==========
@@ -1195,57 +1927,82 @@ EOF
 start_service() {
   need_root
   has_systemd || die "当前系统没有可用 systemd"
-  systemctl start "${SERVICE_NAME}.service"
-  sleep 1
+  is_complete_install || die "HashCake 安装不完整，请先执行 install 修复或 update 更新"
+  if ! restart_service_checked; then
+    systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
+    die "${SERVICE_NAME}.service 启动失败或未能稳定运行"
+  fi
   status_service
 }
 
 stop_service() {
   need_root
   has_systemd || die "当前系统没有可用 systemd"
-  systemctl stop "${SERVICE_NAME}.service" || true
+  systemctl stop "${SERVICE_NAME}.service" \
+    || die "无法停止 ${SERVICE_NAME}.service"
+  if systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+    die "${SERVICE_NAME}.service 停止后仍处于 active 状态"
+  fi
   ok "已停止 ${SERVICE_NAME}"
+}
+
+restart_service_checked() {
+  local restarts_baseline restarts_first restarts_second pid_first pid_second
+  systemctl daemon-reload || return 1
+  systemctl restart "${SERVICE_NAME}.service" || return 1
+  restarts_baseline="$(systemctl show "${SERVICE_NAME}.service" -p NRestarts --value 2>/dev/null || printf '0')"
+  sleep 2
+  if ! systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+    return 1
+  fi
+  restarts_first="$(systemctl show "${SERVICE_NAME}.service" -p NRestarts --value 2>/dev/null || printf '0')"
+  pid_first="$(systemctl show "${SERVICE_NAME}.service" -p MainPID --value 2>/dev/null || printf '0')"
+  if [[ "${restarts_baseline}" =~ ^[0-9]+$ && "${restarts_first}" =~ ^[0-9]+$ && "${pid_first}" =~ ^[0-9]+$ ]]; then
+    if [ "${restarts_first}" -gt "${restarts_baseline}" ] || [ "${pid_first}" -le 0 ]; then
+      return 1
+    fi
+  fi
+  sleep 2
+  if ! systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+    return 1
+  fi
+  restarts_second="$(systemctl show "${SERVICE_NAME}.service" -p NRestarts --value 2>/dev/null || printf '0')"
+  pid_second="$(systemctl show "${SERVICE_NAME}.service" -p MainPID --value 2>/dev/null || printf '0')"
+  if [[ "${restarts_first}" =~ ^[0-9]+$ && "${restarts_second}" =~ ^[0-9]+$ && "${pid_first}" =~ ^[0-9]+$ && "${pid_second}" =~ ^[0-9]+$ ]]; then
+    [ "${restarts_second}" = "${restarts_first}" ] || return 1
+    [ "${pid_second}" = "${pid_first}" ] || return 1
+  fi
 }
 
 restart_service() {
   need_root
   has_systemd || die "当前系统没有可用 systemd"
-  local restarts_before restarts_after
-  restarts_before="$(systemctl show "${SERVICE_NAME}.service" -p NRestarts --value 2>/dev/null || printf '0')"
-  systemctl daemon-reload
-  systemctl restart "${SERVICE_NAME}.service"
-  sleep 2
-  if ! systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+  if ! restart_service_checked; then
     systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
-    die "${SERVICE_NAME}.service 启动失败"
-  fi
-  restarts_after="$(systemctl show "${SERVICE_NAME}.service" -p NRestarts --value 2>/dev/null || printf '0')"
-  case "${restarts_before}:${restarts_after}" in
-    *[!0-9:]*|'':*) ;;
-    *)
-      if [ "${restarts_after}" -gt "${restarts_before}" ]; then
-        systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
-        die "${SERVICE_NAME}.service 启动后发生异常重启"
-      fi
-      ;;
-  esac
-  sleep 2
-  if ! systemctl is-active --quiet "${SERVICE_NAME}.service"; then
-    systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
-    die "${SERVICE_NAME}.service 未能稳定运行"
+    die "${SERVICE_NAME}.service 启动失败或未能稳定运行"
   fi
   status_service
 }
 
 enable_service() {
   need_root
+  has_systemd || die "当前系统没有可用 systemd"
+  [ -f "${SERVICE_FILE}" ] || die "服务文件不存在，请先安装 HashCake"
   systemctl enable "${SERVICE_NAME}.service"
+  systemctl is-enabled --quiet "${SERVICE_NAME}.service" \
+    || die "${SERVICE_NAME}.service 未能进入 enabled 状态"
   ok "已设置开机启动"
 }
 
 disable_service() {
   need_root
-  systemctl disable "${SERVICE_NAME}.service" || true
+  has_systemd || die "当前系统没有可用 systemd"
+  [ -f "${SERVICE_FILE}" ] || die "服务文件不存在，请先安装 HashCake"
+  systemctl disable "${SERVICE_NAME}.service" \
+    || die "无法关闭 ${SERVICE_NAME}.service 的开机启动"
+  if systemctl is-enabled --quiet "${SERVICE_NAME}.service"; then
+    die "${SERVICE_NAME}.service 仍处于 enabled 状态"
+  fi
   ok "已关闭开机启动"
 }
 
@@ -1259,19 +2016,24 @@ status_service() {
 }
 
 log_files() {
+  local path
+  for path in "${LOG_DIR}/hashcake.service.log" "${LOG_DIR}/hashcake.err.log"; do
+    [ -f "${path}" ] && printf '%s\n' "${path}"
+  done
   shopt -s nullglob
-  local files=(
-    "${LOG_DIR}/hashcake.service.log"
-    "${LOG_DIR}/hashcake.err.log"
-    "${LOG_DIR}"/hashcake-debug.log.*
-  )
+  for path in "${LOG_DIR}"/hashcake-debug.log.*; do
+    [ -f "${path}" ] && printf '%s\n' "${path}"
+  done
   shopt -u nullglob
-  printf '%s\n' "${files[@]}"
 }
 
 show_logs() {
   local lines="${LINES:-120}"
   local files
+  case "${lines}" in
+    ''|*[!0-9]*) die "LINES 必须是正整数：${lines}" ;;
+  esac
+  [ "${lines}" -gt 0 ] || die "LINES 必须大于 0"
   mapfile -t files < <(log_files)
   [ "${#files[@]}" -gt 0 ] || die "还没有日志文件：${LOG_DIR}"
   tail -n "${lines}" "${files[@]}"
@@ -1286,13 +2048,18 @@ follow_logs() {
 
 clear_logs() {
   need_root
-  mkdir -p "${LOG_DIR}"
+  is_installed || die "请先安装 HashCake"
+  require_command find
+  ensure_dirs
   find "${LOG_DIR}" -maxdepth 1 -type f -name '*.log*' -exec sh -c ': > "$1"' _ {} \;
   ok "已清空 ${LOG_DIR} 下的日志文件"
 }
 
 edit_config() {
   need_root
+  acquire_installer_lock
+  is_installed || die "请先安装 HashCake"
+  ensure_dirs
   install_config
   local editor="${EDITOR:-}"
   [ -n "${editor}" ] || editor="$(command -v nano || command -v vi || true)"
@@ -1322,13 +2089,15 @@ EOF
     printf 'Prometheus token 文件: %s\n' "${STATE_DIR}/metrics-token"
   fi
   if [ -f "${LOG_DIR}/hashcake.err.log" ] && grep -q 'bootstrap token' "${LOG_DIR}/hashcake.err.log"; then
-    warn "首次 Web访问令牌在 ${LOG_DIR}/hashcake.err.log 中，只在首次启动后 10 分钟内有效"
+    warn "${LOG_DIR}/hashcake.err.log 含首次令牌记录，请将该日志按敏感凭据保护"
   fi
 }
 
 change_web_settings() {
-  need_root
+  preflight_install_or_update
+  is_complete_install || die "HashCake 安装不完整，请先执行 install 修复或 update 更新"
   ensure_dirs
+  begin_install_transaction
   configure_web_defaults_for_update
   local current_port new_port new_prefix new_https
   current_port="$(bind_port "${ADMIN_BIND}")"
@@ -1349,29 +2118,40 @@ change_web_settings() {
     ADMIN_BIND="$(host_from_bind "${ADMIN_BIND}"):${new_port}"
   fi
   [ -n "${new_prefix}" ] && URL_PREFIX="$(normalize_url_prefix "${new_prefix}")"
-  [ -n "${new_https}" ] && HTTPS_ACTIVE="${new_https}"
+  if [ -n "${new_https}" ]; then
+    validate_saved_https "${new_https}"
+    HTTPS_ACTIVE="${new_https}"
+  fi
   write_service
   restart_service
+  commit_install_transaction
   show_paths
 }
 
 change_limit() {
   need_root
+  acquire_installer_lock
+  has_systemd || die "当前系统没有可用 systemd"
   log "设置 Linux 文件句柄上限"
-  grep -q 'root soft nofile 1048576' /etc/security/limits.conf 2>/dev/null || echo 'root soft nofile 1048576' >> /etc/security/limits.conf
-  grep -q 'root hard nofile 1048576' /etc/security/limits.conf 2>/dev/null || echo 'root hard nofile 1048576' >> /etc/security/limits.conf
+  grep -Fqx "${SERVICE_USER} soft nofile 1048576" /etc/security/limits.conf 2>/dev/null \
+    || printf '%s\n' "${SERVICE_USER} soft nofile 1048576" >> /etc/security/limits.conf
+  grep -Fqx "${SERVICE_USER} hard nofile 1048576" /etc/security/limits.conf 2>/dev/null \
+    || printf '%s\n' "${SERVICE_USER} hard nofile 1048576" >> /etc/security/limits.conf
   grep -q 'DefaultLimitNOFILE=1048576' /etc/systemd/system.conf 2>/dev/null || echo 'DefaultLimitNOFILE=1048576' >> /etc/systemd/system.conf
   systemctl daemon-reexec || true
-  ok "已设置连接数上限，完整生效可能需要重启服务器"
+  ok "已设置 ${SERVICE_USER} 和 systemd 的文件句柄上限；服务 unit 也固定使用 1048576"
 }
 
 token_list() {
   [ -x "${BIN_PATH}" ] || die "请先安装 hashcake 二进制"
+  id -u "${SERVICE_USER}" >/dev/null 2>&1 || die "服务用户不存在：${SERVICE_USER}"
   run_as_service_user "${BIN_PATH}" --config "${CONFIG_FILE}" token list --store "${STATE_DIR}/tokens.json"
 }
 
 token_revoke() {
   local site="${1:-}"
+  [ -x "${BIN_PATH}" ] || die "请先安装 hashcake 二进制"
+  id -u "${SERVICE_USER}" >/dev/null 2>&1 || die "服务用户不存在：${SERVICE_USER}"
   if [ -z "${site}" ]; then
     if [ -t 0 ]; then
       read -r -p "请输入要撤销的 site_id: " site
@@ -1386,6 +2166,7 @@ token_revoke() {
 
 token_issue() {
   [ -x "${BIN_PATH}" ] || die "请先安装 hashcake 二进制"
+  id -u "${SERVICE_USER}" >/dev/null 2>&1 || die "服务用户不存在：${SERVICE_USER}"
   local site="${TOKEN_SITE:-}"
   local backend="${TOKEN_BACKEND:-}"
   local ports_text="${TOKEN_PORTS:-}"
@@ -1416,7 +2197,7 @@ token_issue() {
   if [ -z "${ttl}" ] && [ -t 0 ]; then
     read -r -p "有效期秒数，留空=永久: " ttl
   fi
-  if [ -z "${single_cover}" ] && [ "$(printf '%s' "${cover_text}" | tr ',' '\n' | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')" = "1" ]; then
+  if [ -z "${single_cover}" ] && [ "$(count_csv_items "${cover_text}")" = "1" ]; then
     single_cover="1"
   fi
 
@@ -1424,12 +2205,12 @@ token_issue() {
   local item
   IFS=',' read -r -a port_items <<< "${ports_text}"
   for item in "${port_items[@]}"; do
-    item="$(printf '%s' "${item}" | xargs)"
+    item="$(trim_whitespace "${item}")"
     [ -n "${item}" ] && args+=(--port "${item}")
   done
   IFS=',' read -r -a cover_items <<< "${cover_text}"
   for item in "${cover_items[@]}"; do
-    item="$(printf '%s' "${item}" | xargs)"
+    item="$(trim_whitespace "${item}")"
     [ -n "${item}" ] && args+=(--cover-ip "${item}")
   done
   [ -n "${ttl}" ] && args+=(--ttl "${ttl}")
@@ -1440,6 +2221,10 @@ token_issue() {
 
 uninstall() {
   need_root
+  reject_space_path
+  validate_runtime_inputs
+  validate_safe_absolute_path "${INSTALL_DIR}" "安装目录"
+  acquire_installer_lock
   local confirm="${CONFIRM_UNINSTALL:-}"
   if [ "${confirm}" != "yes" ]; then
     if [ -t 0 ]; then
@@ -1513,7 +2298,17 @@ EOF
   esac
 }
 
-cmd="${1:-menu}"
+if [ "${HASHCAKE_INSTALLER_SOURCE_ONLY:-0}" = "1" ]; then
+  # shellcheck disable=SC2317
+  return 0 2>/dev/null || exit 0
+fi
+
+require_bash_runtime
+if [ "$#" -eq 0 ] && [ ! -t 0 ]; then
+  cmd="install"
+else
+  cmd="${1:-menu}"
+fi
 case "${cmd}" in
   install) install_service ;;
   update) update_service ;;
@@ -1534,7 +2329,17 @@ case "${cmd}" in
   token-issue|token-create) shift; token_issue "$@" ;;
   token-list) token_list ;;
   token-revoke) shift; token_revoke "$@" ;;
-  write-service) ensure_dirs; configure_web_defaults_for_update; ensure_metrics_token; install_config; write_service ;;
+  write-service)
+    preflight_install_or_update
+    is_installed || die "请先安装 HashCake"
+    ensure_dirs
+    begin_install_transaction
+    configure_web_defaults_for_update
+    ensure_metrics_token
+    install_config
+    write_service
+    commit_install_transaction
+    ;;
   uninstall) uninstall ;;
   menu|"") menu ;;
   *) die "未知命令：${cmd}" ;;
