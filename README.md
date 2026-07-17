@@ -23,6 +23,17 @@ sudo bash install-hashcake.sh install
 
 运行要求：Linux amd64、bash 4 或更高版本、systemd 247 或更高版本，并使用 root 权限。安装器会在修改系统前检查这些条件；二进制不兼容时会保留并显示原始错误。
 
+## 国内中转安装（带校验）
+
+无法稳定访问 GitHub 的服务器使用下面的命令。安装器会核对下载二进制的 SHA-256，不一致时会拒绝安装：
+
+```bash
+HASHCAKE_VERSION=v0.1.0 \
+HASHCAKE_DOWNLOAD_URL=https://cdn.jsdelivr.net/gh/CakeSystem/hashcake@main/linux-amd64/hashcake-0.1.0-linux-amd64 \
+HASHCAKE_DOWNLOAD_SHA256=b364ce2037468c2c472208d6ed66ee5ca99abc96644a5bf0c31d3e55a7f7bdf8 \
+bash <(curl -fsSL https://cdn.jsdelivr.net/gh/CakeSystem/hashcake@main/install.sh) install
+```
+
 ## 更新程序
 
 ```bash

@@ -16,6 +16,15 @@ bash <(curl -fsSL https://raw.githubusercontent.com/CakeSystem/hashcake/main/ins
 
 首次安装会随机生成 Web 后台端口和安全访问路径，并默认开启自签 HTTPS。
 
+国内服务器可使用带二进制 SHA-256 校验的中转命令：
+
+```bash
+HASHCAKE_VERSION=v0.1.0 \
+HASHCAKE_DOWNLOAD_URL=https://cdn.jsdelivr.net/gh/CakeSystem/hashcake@main/linux-amd64/hashcake-0.1.0-linux-amd64 \
+HASHCAKE_DOWNLOAD_SHA256=b364ce2037468c2c472208d6ed66ee5ca99abc96644a5bf0c31d3e55a7f7bdf8 \
+bash <(curl -fsSL https://cdn.jsdelivr.net/gh/CakeSystem/hashcake@main/install.sh) install
+```
+
 ## 安装器可靠性
 
 - 官方二进制下载会强制核对 `SHA256SUMS`，并在执行前检查实际版本与运行兼容性。
