@@ -11,7 +11,7 @@ Release 资产只包含二进制文件。安装脚本位于仓库根目录 `inst
 ## 安装
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/CakeSystem/hashcake/main/install.sh) install
+bash <(curl -fsSL https://raw.githubusercontent.com/CakeSystem/hashcake/main/install.sh)
 ```
 
 首次安装会随机生成 Web 后台端口和安全访问路径，并默认开启自签 HTTPS。
@@ -22,9 +22,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/CakeSystem/hashcake/main/ins
 
 ```bash
 HASHCAKE_VERSION=v0.1.0 \
-HASHCAKE_DOWNLOAD_URL=https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@main/linux-amd64/hashcake-0.1.0-linux-amd64 \
+HASHCAKE_DOWNLOAD_URL=https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@d42a9ccfcdefe3b1557495efcc2d5c412f1c242f/linux-amd64/hashcake-0.1.0-linux-amd64 \
 HASHCAKE_DOWNLOAD_SHA256=f3b9fe5489f581dabdbecc23348b63a5970f2d5a0dd17fa82b5f7be910595c95 \
-bash <(curl -fsSL https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@main/install.sh) install
+bash <(curl -fsSL https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@d42a9ccfcdefe3b1557495efcc2d5c412f1c242f/install.sh)
 ```
 
 ## 安装器可靠性
