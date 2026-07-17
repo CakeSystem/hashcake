@@ -16,13 +16,15 @@ bash <(curl -fsSL https://raw.githubusercontent.com/CakeSystem/hashcake/main/ins
 
 首次安装会随机生成 Web 后台端口和安全访问路径，并默认开启自签 HTTPS。
 
+首次登录令牌有效 10 分钟，只用于创建首个管理员账号；账号创建成功后立即失效，之后使用账号与密码登录。
+
 国内服务器可使用带二进制 SHA-256 校验的中转命令：
 
 ```bash
 HASHCAKE_VERSION=v0.1.0 \
-HASHCAKE_DOWNLOAD_URL=https://cdn.jsdelivr.net/gh/CakeSystem/hashcake@main/linux-amd64/hashcake-0.1.0-linux-amd64 \
-HASHCAKE_DOWNLOAD_SHA256=b364ce2037468c2c472208d6ed66ee5ca99abc96644a5bf0c31d3e55a7f7bdf8 \
-bash <(curl -fsSL https://cdn.jsdelivr.net/gh/CakeSystem/hashcake@main/install.sh) install
+HASHCAKE_DOWNLOAD_URL=https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@main/linux-amd64/hashcake-0.1.0-linux-amd64 \
+HASHCAKE_DOWNLOAD_SHA256=f3b9fe5489f581dabdbecc23348b63a5970f2d5a0dd17fa82b5f7be910595c95 \
+bash <(curl -fsSL https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@main/install.sh) install
 ```
 
 ## 安装器可靠性

@@ -35,6 +35,10 @@ EXPECTED_BINARY_VERSION=""
 WEB_PORT_MIN="${HASHCAKE_WEB_PORT_MIN:-10000}"
 WEB_PORT_MAX="${HASHCAKE_WEB_PORT_MAX:-60000}"
 FIRST_WEB_TOKEN=""
+# The binary's pending bootstrap window is fixed at ten minutes.  This is
+# deliberately a display constant only: the server remains the source of
+# truth; installer confirmation only makes its hash survive the final restart.
+BOOTSTRAP_TTL_MINUTES=10
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -1572,7 +1576,7 @@ install_config() {
   else
     write_default_config
     chmod 600 "${CONFIG_FILE}"
-    warn "未找到项目内 hashcake.yaml，已生成空 ports 配置；上线前请编辑 ${CONFIG_FILE}"
+    ok "已生成可直接启动的默认配置（暂未启用矿机端口，可在 Web 后台按需添加）"
   fi
   chmod 600 "${CONFIG_FILE}"
   chown "${SERVICE_USER}:${SERVICE_GROUP}" "${CONFIG_FILE}"
@@ -1816,7 +1820,8 @@ EOF
   if [ -n "${token}" ]; then
     cat <<EOF
 首次 Web访问令牌: ${token}
-有效期: 已确认为长期管理员令牌，请立即保存并妥善保管
+有效期: ${BOOTSTRAP_TTL_MINUTES} 分钟
+用途: 仅用于创建首个管理员账号；账号创建成功后立即失效
 EOF
   else
     cat <<EOF
@@ -1881,7 +1886,7 @@ install_service() {
     ok "已确认首次 Web访问令牌并写入最终 HTTPS 与安全访问路径"
   fi
   if [ "${START_AFTER_INSTALL}" = "1" ]; then
-    restart_service
+    restart_service 0
   else
     stop_service
     ok "已安装，未自动启动"
@@ -1904,7 +1909,7 @@ update_service() {
   arm_firewall_rollback
   disable_firewall_now
   if [ "${START_AFTER_INSTALL}" = "1" ]; then
-    restart_service
+    restart_service 0
   else
     stop_service
     ok "已更新，未自动启动"
@@ -1971,13 +1976,16 @@ restart_service_checked() {
 }
 
 restart_service() {
+  local show_status="${1:-1}"
   need_root
   has_systemd || die "当前系统没有可用 systemd"
   if ! restart_service_checked; then
     systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
     die "${SERVICE_NAME}.service 启动失败或未能稳定运行"
   fi
-  status_service
+  if [ "${show_status}" = "1" ]; then
+    status_service
+  fi
 }
 
 enable_service() {
@@ -2119,7 +2127,7 @@ change_web_settings() {
     HTTPS_ACTIVE="${new_https}"
   fi
   write_service
-  restart_service
+  restart_service 0
   commit_install_transaction
   show_paths
 }
