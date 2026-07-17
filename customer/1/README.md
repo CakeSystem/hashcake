@@ -12,9 +12,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/CakeSystem/hashcake/main/cus
 
 ```bash
 HASHCAKE_VERSION=v0.1.0 \
-HASHCAKE_DOWNLOAD_URL=https://cdn.jsdelivr.net/gh/CakeSystem/hashcake@main/customer/1/linux-amd64/hashcake-0.1.0-linux-amd64 \
-HASHCAKE_DOWNLOAD_SHA256=810925c2ba1ebbeeb1961cd8107d0f42ff2cfe80a3443b0c792a392f0cc7bba7 \
-bash <(curl -fsSL https://cdn.jsdelivr.net/gh/CakeSystem/hashcake@main/customer/1/install.sh) install
+HASHCAKE_DOWNLOAD_URL=https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@main/customer/1/linux-amd64/hashcake-0.1.0-linux-amd64 \
+HASHCAKE_DOWNLOAD_SHA256=e7d330698ada677b8b4eeef13a17bb3ad68e674450406daaf473701a23c26f78 \
+bash <(curl -fsSL https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@main/customer/1/install.sh) install
 ```
 
 ## Windows 下载
