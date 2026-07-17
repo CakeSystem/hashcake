@@ -1812,10 +1812,6 @@ print_install_result() {
 ========== HashCake 安装结果 ==========
 当前版本: $([ -x "${BIN_PATH}" ] && "${BIN_PATH}" --version 2>/dev/null || printf '未知')
 后台访问地址: $(admin_url)
-安装目录: ${INSTALL_DIR}
-配置文件: ${CONFIG_FILE}
-状态目录: ${STATE_DIR}
-日志目录: ${LOG_DIR}
 EOF
   if [ -n "${token}" ]; then
     cat <<EOF
