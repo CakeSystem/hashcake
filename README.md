@@ -1,12 +1,28 @@
 # HashCake
 
-HashCake 是服务端 Stratum 代理，部署在矿机和上游矿池之间。它负责统一接入矿机、连接主矿池和费用矿池，并通过管理后台观察端口、矿机、上游连接、CakeBox 隧道和运行指标。
+**面向矿场与算力运营团队的一体化 Stratum 矿池代理与管理平台。**
 
-## 配套项目
+## HashCake 是什么
 
-- CakeBox 客户端：https://github.com/CakeSystem/cakebox
+HashCake 部署在矿机与上游矿池之间，统一处理矿机接入、矿池连接、费用策略和运行监控。通过浏览器即可集中管理代理端口、矿机与矿池线路，并实时查看算力、份额、延迟、告警和服务器状态。
 
-## 首次安装
+对于不同地区的矿场，可配合 [CakeBox 客户端](https://github.com/CakeSystem/cakebox) 建立加密隧道，将矿机安全接入 HashCake，降低跨地域接入与线路维护的复杂度。
+
+## 核心能力
+
+| 能力 | 说明 |
+| --- | --- |
+| 统一接入与管理 | 集中管理代理端口、矿机、矿池线路和 CakeBox 站点，支持配置导入与导出。 |
+| 主备矿池线路 | 支持主备上游矿池、断线重连和异常告警，降低线路波动对运行的影响。 |
+| 费用策略管理 | 可按端口设置费用矿池与分配比例，并持续对比目标比例和实际比例。 |
+| 可视化运营后台 | 实时查看算力、在线与掉线设备、接受与拒绝份额、矿池延迟及服务器资源。 |
+| 异地矿场接入 | 配合 CakeBox 建立加密隧道，统一接入和管理不同地区的矿场。 |
+| 安全与审计 | 支持 HTTPS、账号权限、安全访问路径、黑名单和管理操作审计。 |
+| 可靠安装与升级 | Linux 支持一键安装和下载校验；升级保留原有配置，失败时自动恢复旧版本。 |
+
+## 快速开始
+
+### Linux
 
 在 Linux amd64 服务器上执行：
 
@@ -23,9 +39,10 @@ sudo bash install-hashcake.sh install
 
 运行要求：Linux amd64、bash 4 或更高版本、systemd 247 或更高版本，并使用 root 权限。安装器会在修改系统前检查这些条件；二进制不兼容时会保留并显示原始错误。
 
-首次登录令牌有效 10 分钟，只用于创建首个管理员账号；账号创建成功后立即失效，之后使用账号与密码登录。
+> [!IMPORTANT]
+> 首次登录令牌有效 10 分钟，只用于创建首个管理员账号；账号创建成功后立即失效，之后使用账号与密码登录。
 
-## 国内中转安装（带校验）
+### 国内服务器
 
 无法稳定访问 GitHub 的服务器使用下面的命令。安装器会核对下载二进制的 SHA-256，不一致时会拒绝安装：
 
@@ -36,15 +53,7 @@ HASHCAKE_DOWNLOAD_SHA256=f3b9fe5489f581dabdbecc23348b63a5970f2d5a0dd17fa82b5f7be
 bash <(curl -fsSL https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@d42a9ccfcdefe3b1557495efcc2d5c412f1c242f/install.sh)
 ```
 
-## 更新程序
-
-```bash
-sudo bash install-hashcake.sh update
-```
-
-更新会保留已有 Web 端口、安全访问路径、账号、令牌、配置和状态目录。新版本启动失败时，安装器会自动恢复旧二进制、旧服务文件和原有防火墙状态。
-
-## Windows 下载
+### Windows
 
 Windows amd64 版本可在 Release 页面下载：
 
@@ -52,32 +61,10 @@ Windows amd64 版本可在 Release 页面下载：
 https://github.com/CakeSystem/hashcake/releases/download/v0.1.0/hashcake-0.1.0-windows.exe
 ```
 
-## 默认路径
+## 更新 HashCake
 
-- 安装目录：`/opt/hashcake`
-- 配置文件：`/opt/hashcake/config/hashcake.yaml`
-- 状态目录：`/opt/hashcake/state`
-- 日志目录：`/opt/hashcake/logs`
-- systemd 服务名：`hashcake`
-- 管理后台监听：首次安装时在 `10000-60000` 内随机生成，默认绑定 `0.0.0.0`
-- 安全访问路径：首次安装时随机生成，例如 `/hc-a8f3k9m2/`
-- HTTPS：默认开启自签 HTTPS，不申请证书
+```bash
+sudo bash install-hashcake.sh update
+```
 
-## 环境变量
-
-- `HASHCAKE_VERSION=v0.1.0`：安装指定版本，默认从 `linux-amd64/` 文件夹选择最新版本。
-- `HASHCAKE_ALLOW_PRERELEASE=1`：允许 `latest` 选择预发布版本；默认只选择稳定版。
-- `HASHCAKE_RELEASE_BRANCH=main`：读取发布文件的 Git 分支。
-- `HASHCAKE_HOME=/opt/hashcake`：安装目录。
-- `HASHCAKE_CONFIG_DIR=/opt/hashcake/config`：配置目录；必须允许 `hashcake` 服务用户原子保存配置。
-- `HASHCAKE_DOWNLOAD_URL=https://...`：从指定地址下载二进制。
-- `HASHCAKE_DOWNLOAD_SHA256=64位十六进制`：校验自定义下载地址；官方仓库下载会自动使用 `SHA256SUMS` 校验。
-- `HASHCAKE_ADMIN_BIND=0.0.0.0:12345`：首次安装或修改 Web 设置时指定后台监听地址。
-- `HASHCAKE_URL_PREFIX=mirage`：首次安装或修改 Web 设置时指定安全访问路径。
-
-## 发布文件
-
-- `linux-amd64/hashcake-0.1.0-linux-amd64`：linux-amd64 可执行文件，已内嵌 Web 管理后台。
-- `install.sh`：仓库根目录的一键安装和管理脚本。
-- Release 资产：上传二进制文件，例如 `hashcake-0.1.0-linux-amd64`。
-- `SHA256SUMS`：公开发布文件校验和；安装器下载官方二进制前会强制核对。
+更新会保留已有 Web 端口、安全访问路径、账号、令牌、配置和状态目录。新版本启动失败时，安装器会自动恢复旧二进制、旧服务文件和原有防火墙状态。
