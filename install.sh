@@ -2326,17 +2326,21 @@ EOF
   esac
 }
 
+resolve_installer_command() {
+  if [ "$#" -eq 0 ] || [ -z "${1:-}" ]; then
+    printf 'menu'
+  else
+    printf '%s' "$1"
+  fi
+}
+
 if [ "${HASHCAKE_INSTALLER_SOURCE_ONLY:-0}" = "1" ]; then
   # shellcheck disable=SC2317
   return 0 2>/dev/null || exit 0
 fi
 
 require_bash_runtime
-if [ "$#" -eq 0 ] && [ ! -t 0 ]; then
-  cmd="install"
-else
-  cmd="${1:-menu}"
-fi
+cmd="$(resolve_installer_command "$@")"
 case "${cmd}" in
   install) install_service ;;
   update) update_service ;;
