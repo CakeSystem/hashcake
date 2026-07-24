@@ -47,9 +47,9 @@ sudo bash install-hashcake.sh install
 无法稳定访问 GitHub 的服务器使用下面的命令。安装器会核对下载二进制的 SHA-256，不一致时会拒绝安装：
 
 ```bash
-HASHCAKE_VERSION=v0.1.0 \
-HASHCAKE_DOWNLOAD_URL=https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@d42a9ccfcdefe3b1557495efcc2d5c412f1c242f/linux-amd64/hashcake-0.1.0-linux-amd64 \
-HASHCAKE_DOWNLOAD_SHA256=f3b9fe5489f581dabdbecc23348b63a5970f2d5a0dd17fa82b5f7be910595c95 \
+HASHCAKE_VERSION=v0.1.1 \
+HASHCAKE_DOWNLOAD_URL=https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@d42a9ccfcdefe3b1557495efcc2d5c412f1c242f/linux-amd64/hashcake-0.1.1-linux-amd64 \
+HASHCAKE_DOWNLOAD_SHA256=f22b357dabc25b9cc7e96991577427da6e338d3048456da6c8509bec9e2562a4 \
 bash <(curl -fsSL https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@d42a9ccfcdefe3b1557495efcc2d5c412f1c242f/install.sh)
 ```
 
@@ -58,7 +58,7 @@ bash <(curl -fsSL https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@d42a9ccfcdefe
 Windows amd64 版本可在 Release 页面下载：
 
 ```text
-https://github.com/CakeSystem/hashcake/releases/download/v0.1.0/hashcake-0.1.0-windows.exe
+https://github.com/CakeSystem/hashcake/releases/download/v0.1.1/hashcake-0.1.1-windows.exe
 ```
 
 ## 更新 HashCake
