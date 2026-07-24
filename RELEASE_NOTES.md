@@ -11,20 +11,17 @@ Release 资产只包含二进制文件。安装脚本位于仓库根目录 `inst
 ## 安装
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/CakeSystem/hashcake/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/CakeSystem/hashcake/main/install.sh) menu
 ```
 
 首次安装会随机生成 Web 后台端口和安全访问路径，并默认开启自签 HTTPS。
 
 首次登录令牌有效 10 分钟，只用于创建首个管理员账号；账号创建成功后立即失效，之后使用账号与密码登录。
 
-国内服务器可使用带二进制 SHA-256 校验的中转命令：
+国内服务器可使用下面的通用管理入口。该命令不绑定当前已安装版本；选择安装或更新时，安装器会自动查找官方最新稳定版，并根据 SHA256SUMS 校验下载文件：
 
 ```bash
-HASHCAKE_VERSION=v0.1.1 \
-HASHCAKE_DOWNLOAD_URL=https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@2b190e40eb529ae7fb1b5d67ff34c5d906a5a35e/linux-amd64/hashcake-0.1.1-linux-amd64 \
-HASHCAKE_DOWNLOAD_SHA256=f22b357dabc25b9cc7e96991577427da6e338d3048456da6c8509bec9e2562a4 \
-bash <(curl -fsSL https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@2b190e40eb529ae7fb1b5d67ff34c5d906a5a35e/install.sh)
+bash <(curl -fsSL https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@2b190e40eb529ae7fb1b5d67ff34c5d906a5a35e/install.sh) menu
 ```
 
 ## 安装器可靠性
