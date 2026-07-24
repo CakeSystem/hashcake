@@ -8,12 +8,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/CakeSystem/hashcake/main/cus
 
 ## 国内中转安装（带校验）
 
-下面的命令会固定安装 v0.1.0，并核对定制版二进制的 SHA-256；校验不一致时安装器会拒绝安装：
+下面的命令会固定安装 v0.1.1，并核对定制版二进制的 SHA-256；校验不一致时安装器会拒绝安装：
 
 ```bash
-HASHCAKE_VERSION=v0.1.0 \
-HASHCAKE_DOWNLOAD_URL=https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@d42a9ccfcdefe3b1557495efcc2d5c412f1c242f/customer/1/linux-amd64/hashcake-0.1.0-linux-amd64 \
-HASHCAKE_DOWNLOAD_SHA256=e7d330698ada677b8b4eeef13a17bb3ad68e674450406daaf473701a23c26f78 \
+HASHCAKE_VERSION=v0.1.1 \
+HASHCAKE_DOWNLOAD_URL=https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@d42a9ccfcdefe3b1557495efcc2d5c412f1c242f/customer/1/linux-amd64/hashcake-0.1.1-linux-amd64 \
+HASHCAKE_DOWNLOAD_SHA256=c2594cff3b883181a121f6b591edbd004be6d36d9851b3568c31e8b0dc71f365 \
 bash <(curl -fsSL https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@d42a9ccfcdefe3b1557495efcc2d5c412f1c242f/customer/1/install.sh)
 ```
 
