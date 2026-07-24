@@ -8,6 +8,8 @@ RELEASE_REPO="${HASHCAKE_RELEASE_REPO:-CakeSystem/hashcake}"
 RELEASE_TAG="${HASHCAKE_VERSION:-latest}"
 RELEASE_BRANCH="${HASHCAKE_RELEASE_BRANCH:-main}"
 RELEASE_PLATFORM="${HASHCAKE_RELEASE_PLATFORM:-linux-amd64}"
+RELEASE_SUMS_PATH="${EDITION_PATH}/SHA256SUMS"
+RELEASE_MIRROR_BASE="${HASHCAKE_RELEASE_MIRROR_BASE-https://cdn.jsdmirror.com/gh/${RELEASE_REPO}@${RELEASE_BRANCH}}"
 SERVICE_NAME="${HASHCAKE_SERVICE:-hashcake}"
 SERVICE_USER="${HASHCAKE_USER:-hashcake}"
 SERVICE_GROUP="${HASHCAKE_GROUP:-${SERVICE_USER}}"
@@ -121,6 +123,14 @@ validate_runtime_inputs() {
   esac
   case "${RELEASE_PLATFORM}" in
     ''|*[!A-Za-z0-9._-]*) die "发布平台名称不安全：${RELEASE_PLATFORM}" ;;
+  esac
+  case "${RELEASE_MIRROR_BASE}" in
+    '') ;;
+    https://*)
+      printf '%s' "${RELEASE_MIRROR_BASE}" | grep -Eq '^https://[A-Za-z0-9:/?&=._%+#~@-]+$' \
+        || die "发布镜像地址包含不安全字符"
+      ;;
+    *) die "HASHCAKE_RELEASE_MIRROR_BASE 必须使用 https://" ;;
   esac
   if [ "${RELEASE_TAG}" != "latest" ]; then
     printf '%s' "${RELEASE_TAG}" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
@@ -747,10 +757,20 @@ backup_transaction_file() {
 }
 
 restore_transaction_file() {
-  local path="$1" name="$2" existed="$3"
+  local path="$1" name="$2" existed="$3" restore_tmp
   if [ "${existed}" = "1" ]; then
-    cp -p -- "${INSTALL_TRANSACTION_DIR}/${name}" "${path}" \
-      || { warn "无法恢复 ${path}"; return 1; }
+    restore_tmp="$(mktemp "$(dirname -- "${path}")/.hashcake-restore.XXXXXX")" \
+      || { warn "无法为 ${path} 创建恢复临时文件"; return 1; }
+    if ! cp -p -- "${INSTALL_TRANSACTION_DIR}/${name}" "${restore_tmp}"; then
+      rm -f -- "${restore_tmp}"
+      warn "无法准备 ${path} 的恢复文件"
+      return 1
+    fi
+    if ! mv -f -- "${restore_tmp}" "${path}"; then
+      rm -f -- "${restore_tmp}"
+      warn "无法原子恢复 ${path}"
+      return 1
+    fi
   else
     rm -f -- "${path}" || return 1
   fi
@@ -810,8 +830,12 @@ rollback_install_transaction() {
     systemctl stop "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
   fi
 
-  restore_transaction_file "${BIN_PATH}" binary "${TXN_HAD_BINARY}" || failed=1
-  restore_transaction_file "${SERVICE_FILE}" service "${TXN_HAD_SERVICE}" || failed=1
+  if [ "${TXN_BINARY_CHANGED}" = "1" ]; then
+    restore_transaction_file "${BIN_PATH}" binary "${TXN_HAD_BINARY}" || failed=1
+  fi
+  if [ "${TXN_SERVICE_CHANGED}" = "1" ]; then
+    restore_transaction_file "${SERVICE_FILE}" service "${TXN_HAD_SERVICE}" || failed=1
+  fi
   restore_transaction_file "${INSTALL_ENV}" install-env "${TXN_HAD_INSTALL_ENV}" || failed=1
   restore_transaction_file "${LEGACY_INSTALL_ENV}" legacy-install-env "${TXN_HAD_LEGACY_INSTALL_ENV}" || failed=1
   restore_transaction_file "${STATE_DIR}/admin.json" admin-json "${TXN_HAD_ADMIN_JSON}" || failed=1
@@ -1320,33 +1344,35 @@ raise SystemExit(f"bootstrap confirmation failed: {last_error}")
 PY
 }
 
-github_api_get() {
-  local url="$1"
-  local args=(--fail --silent --show-error --location --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 60)
-  if [ -n "${GITHUB_TOKEN:-}" ]; then
-    curl "${args[@]}" -H "Authorization: Bearer ${GITHUB_TOKEN}" "${url}"
-  elif [ -n "${GH_TOKEN:-}" ]; then
-    curl "${args[@]}" -H "Authorization: Bearer ${GH_TOKEN}" "${url}"
-  else
-    curl "${args[@]}" "${url}"
-  fi
-}
-
 download_repo_file() {
   local path="$1"
   local dst="$2"
   local args=(--fail --silent --show-error --location --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 600)
-  local url
-  if [ -n "${GITHUB_TOKEN:-}" ]; then
-    url="https://api.github.com/repos/${RELEASE_REPO}/contents/${path}?ref=${RELEASE_BRANCH}"
-    curl "${args[@]}" -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github.raw" "${url}" -o "${dst}"
-  elif [ -n "${GH_TOKEN:-}" ]; then
-    url="https://api.github.com/repos/${RELEASE_REPO}/contents/${path}?ref=${RELEASE_BRANCH}"
-    curl "${args[@]}" -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github.raw" "${url}" -o "${dst}"
-  else
-    url="https://api.github.com/repos/${RELEASE_REPO}/contents/${path}?ref=${RELEASE_BRANCH}"
-    curl "${args[@]}" -H "Accept: application/vnd.github.raw" "${url}" -o "${dst}"
+  local url part="${dst}.repo-download.$$"
+  rm -f -- "${part}"
+  if [ -z "${GITHUB_TOKEN:-}" ] && [ -z "${GH_TOKEN:-}" ] && [ -n "${RELEASE_MIRROR_BASE}" ]; then
+    url="${RELEASE_MIRROR_BASE%/}/${path}"
+    if curl "${args[@]}" "${url}" -o "${part}"; then
+      mv -f -- "${part}" "${dst}"
+      return 0
+    fi
+    rm -f -- "${part}"
+    printf '注意: 国内发布镜像读取失败，尝试 GitHub 备用源\n' >&2
   fi
+  url="https://api.github.com/repos/${RELEASE_REPO}/contents/${path}?ref=${RELEASE_BRANCH}"
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    curl "${args[@]}" -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github.raw" "${url}" -o "${part}"
+  elif [ -n "${GH_TOKEN:-}" ]; then
+    curl "${args[@]}" -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github.raw" "${url}" -o "${part}"
+  else
+    curl "${args[@]}" -H "Accept: application/vnd.github.raw" "${url}" -o "${part}"
+  fi
+  local status=$?
+  if [ "${status}" -ne 0 ]; then
+    rm -f -- "${part}"
+    return "${status}"
+  fi
+  mv -f -- "${part}" "${dst}"
 }
 
 download_url_file() {
@@ -1381,7 +1407,7 @@ verify_file_sha256() {
 repo_asset_sha256() {
   local asset_path="$1" sums_file expected
   sums_file="$(mktemp "${INSTALL_DIR}/.SHA256SUMS.XXXXXX")"
-  if ! download_repo_file "${EDITION_PATH}/SHA256SUMS" "${sums_file}"; then
+  if ! download_repo_file "${RELEASE_SUMS_PATH}" "${sums_file}"; then
     rm -f -- "${sums_file}"
     die "定制版 ${EDITION_ID} 发布目录缺少 SHA256SUMS，已拒绝安装未经校验的定制二进制"
   fi
@@ -1400,22 +1426,20 @@ asset_name_for_version() {
     return
   fi
   command -v curl >/dev/null 2>&1 || die "缺少 curl，无法查询 latest Release"
-  local listing names name
-  listing="$(github_api_get "https://api.github.com/repos/${RELEASE_REPO}/contents/${EDITION_PATH}/${RELEASE_PLATFORM}?ref=${RELEASE_BRANCH}")" \
-    || die "无法读取 ${RELEASE_REPO}/${EDITION_PATH}/${RELEASE_PLATFORM} 发布目录"
-  if ! names="$(printf '%s' "${listing}" | python3 -c '
-import json
-import sys
-
-data = json.load(sys.stdin)
-if not isinstance(data, list):
-    raise SystemExit(1)
-for entry in data:
-    if isinstance(entry, dict) and isinstance(entry.get("name"), str):
-        print(entry["name"])
-')"; then
-    die "GitHub 发布目录返回了无法识别的数据"
+  local sums_file names name
+  sums_file="$(mktemp "${TMPDIR:-/tmp}/hashcake-SHA256SUMS.XXXXXX")"
+  if ! download_repo_file "${RELEASE_SUMS_PATH}" "${sums_file}"; then
+    rm -f -- "${sums_file}"
+    die "无法读取 ${RELEASE_REPO}/${RELEASE_SUMS_PATH}，无法确定 Edition ${EDITION_ID} 最新版本"
   fi
+  names="$(awk -v platform="${RELEASE_PLATFORM}/" '
+    index($2, platform) == 1 {
+      name = $2
+      sub(/^.*\//, "", name)
+      print name
+    }
+  ' "${sums_file}")"
+  rm -f -- "${sums_file}"
   if [ "${ALLOW_PRERELEASE}" = "1" ]; then
     name="$(printf '%s\n' "${names}" \
       | grep -E "^${prefix}-[0-9][0-9A-Za-z._-]*-${RELEASE_PLATFORM}$" \
@@ -1427,7 +1451,7 @@ for entry in data:
       | sort -V \
       | tail -n 1)"
   fi
-  [ -n "${name}" ] || die "无法在 ${RELEASE_REPO}/${EDITION_PATH}/${RELEASE_PLATFORM} 找到 ${prefix} 的定制版发布文件"
+  [ -n "${name}" ] || die "无法在 ${RELEASE_REPO}/${RELEASE_SUMS_PATH} 找到 ${prefix} 的定制版发布文件"
   printf '%s' "${name}"
 }
 
