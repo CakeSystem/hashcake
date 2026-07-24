@@ -22,9 +22,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/CakeSystem/hashcake/main/ins
 
 ```bash
 HASHCAKE_VERSION=v0.1.1 \
-HASHCAKE_DOWNLOAD_URL=https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@d42a9ccfcdefe3b1557495efcc2d5c412f1c242f/linux-amd64/hashcake-0.1.1-linux-amd64 \
+HASHCAKE_DOWNLOAD_URL=https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@2b190e40eb529ae7fb1b5d67ff34c5d906a5a35e/linux-amd64/hashcake-0.1.1-linux-amd64 \
 HASHCAKE_DOWNLOAD_SHA256=f22b357dabc25b9cc7e96991577427da6e338d3048456da6c8509bec9e2562a4 \
-bash <(curl -fsSL https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@d42a9ccfcdefe3b1557495efcc2d5c412f1c242f/install.sh)
+bash <(curl -fsSL https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@2b190e40eb529ae7fb1b5d67ff34c5d906a5a35e/install.sh)
 ```
 
 ## 安装器可靠性
