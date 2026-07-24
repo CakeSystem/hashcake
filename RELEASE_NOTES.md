@@ -21,7 +21,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/CakeSystem/hashcake/main/ins
 国内服务器可使用下面的通用管理入口。该命令不绑定当前已安装版本；选择安装或更新时，安装器会自动查找官方最新稳定版，并根据 SHA256SUMS 校验下载文件：
 
 ```bash
-bash <(curl -fsSL https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@2b190e40eb529ae7fb1b5d67ff34c5d906a5a35e/install.sh) menu
+bash <(curl -fsSL https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@fb1b78b776a2fa78e524c2d5b7ee1e4652e90233/install.sh) menu
 ```
 
 ## 安装器可靠性
