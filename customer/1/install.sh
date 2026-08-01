@@ -1683,6 +1683,50 @@ download_hashcake() {
   return 0
 }
 
+# 用**候选**二进制校验**已部署的配置**。必须在 `mv -fT` 顶掉旧二进制之前跑。
+#
+# 存在的理由：配置校验是 fail-closed 的（例如端口重复会直接拒绝启动）。没有这一步
+# 时，一份旧版本能带病运行的配置会走成「停服务 → 新进程起不来 → 事务回滚」，中间
+# 矿机实打实地断一次；若 START_AFTER_INSTALL=0，新二进制还会被提交，故障推迟到下次
+# 人工启动才暴露。
+#
+# 为什么必须在 mv 之前、而不是装完再检：`mv` 的下一行就是 `TXN_BINARY_CHANGED=1`，
+# 而 rollback_install_transaction 见到该标志会先 `systemctl stop` 再还原、再重启 ——
+# 那样即使检出问题也已经断了一次矿机。放在 mv 前，失败时两个 changed 标志都还是 0，
+# 回滚不会碰服务，旧二进制与运行中的进程全程未被触碰。
+#
+# 用 run_as_service_user 而非 root 执行：顺带验证守护进程的真实身份读得到这份配置。
+#
+# **边界**：它只回答「这份 YAML 能否通过 Config::validate」，不等于「新进程一定能
+# 起来」。守护进程启动路径还会校验客户材料、初始化 miner TLS 等资源，那些失败本命令
+# 看不到。同样地，本检查与真正的重启之间还隔着写 service、防火墙等步骤，其间管理面或
+# 手工编辑仍可改配置——这个窗口没有被消除，只是被大幅收窄。
+assert_config_accepted_by_candidate() {
+  local candidate_bin="$1" probe_output
+  # 本函数在 install_config 之后调用，配置此刻必须存在。缺文件不是「正常跳过」而是
+  # 不变量被破坏（竞态或前面的步骤没写成功），放行等于把问题推给重启后的进程。
+  [ -f "${CONFIG_FILE}" ] \
+    || die "配置文件 ${CONFIG_FILE} 在写入后消失，已中止本次变更"
+  # 能力探测走**正向**匹配顶层帮助，而不是「check-config 执行失败就当作旧版本」——
+  # 后者会把子命令自身的任何异常（panic、依赖缺失、被 seccomp 拦下）一并解释成
+  # 「不支持」而静默放行。`--version` 已在上面跑通，所以 `--help` 再失败属于真故障。
+  local help_output
+  help_output="$(run_as_service_user "${candidate_bin}" --help 2>&1)" \
+    || die "候选 HashCake 二进制无法输出帮助信息，已中止本次变更"
+  case "${help_output}" in
+    *check-config*) ;;
+    *)
+      warn "候选 HashCake 二进制不含 check-config 子命令（版本回退），跳过变更前配置预检"
+      return 0
+      ;;
+  esac
+  if ! probe_output="$(run_as_service_user "${candidate_bin}" check-config --config "${CONFIG_FILE}" 2>&1)"; then
+    printf '%s\n' "${probe_output}" >&2
+    return 1
+  fi
+  printf '%s\n' "${probe_output}"
+}
+
 install_binary() {
   local src="${HASHCAKE_BIN_SOURCE:-}" candidate source_label version_output actual_version
   EXPECTED_BINARY_VERSION=""
@@ -1729,6 +1773,22 @@ ${version_output:-未返回错误详情。请检查 CPU 架构和 GLIBC 版本�
   if [ -n "${EXPECTED_BINARY_VERSION}" ] && [ "${actual_version}" != "${EXPECTED_BINARY_VERSION}" ]; then
     rm -f -- "${candidate}"
     die "HashCake 候选二进制版本不匹配：期望 ${EXPECTED_BINARY_VERSION}，实际 ${actual_version:-未知}"
+  fi
+  # 最后一道门：候选二进制必须接受当前已落盘的配置。放在 mv 之前，失败时旧二进制
+  # 原封未动、服务全程不被停。与上面几处候选失败一样清理临时文件再 die。
+  #
+  # 修复指引必须是「先停服务再改配置」，不能是「保持运行、在线改」：如果现网配置是
+  # 重复端口，旧版本的热重载正是本次要修的那个 bug —— 运维一保存 YAML，旧进程 diff
+  # 就会为被删掉的那条产出 Removed，当场拆掉在线端口。让运维在不知情的情况下触发它，
+  # 比这次升级失败本身更糟。
+  if ! assert_config_accepted_by_candidate "${candidate}"; then
+    rm -f -- "${candidate}"
+    die "新版本拒绝当前配置 ${CONFIG_FILE}；已中止本次变更，旧二进制与运行中的服务均未改动。
+修复步骤（请按顺序，不要在服务运行时直接改配置）：
+  1) systemctl stop ${SERVICE_NAME}
+  2) 按上方提示修正 ${CONFIG_FILE}
+  3) 重新执行本次更新
+当前运行的旧版本对这类配置错误存在已知的热重载缺陷：在线保存配置可能立即断开该端口上的矿机。"
   fi
   mv -fT "${candidate}" "${BIN_PATH}"
   TXN_BINARY_CHANGED=1
