@@ -20,6 +20,7 @@ STATE_DIR="${HASHCAKE_STATE_DIR:-${INSTALL_DIR}/state}"
 LOG_DIR="${HASHCAKE_LOG_DIR:-${INSTALL_DIR}/logs}"
 BACKUP_DIR="${HASHCAKE_BACKUP_DIR:-${INSTALL_DIR}/backup}"
 BIN_PATH="${INSTALL_DIR}/hashcake"
+MANIFEST_PATH="${INSTALL_DIR}/hashcake.manifest.json"
 INSTALLER_STATE_DIR="${HASHCAKE_INSTALLER_STATE_DIR:-${INSTALL_DIR}/.installer}"
 INSTALL_ENV="${INSTALLER_STATE_DIR}/install.env"
 LEGACY_INSTALL_ENV="${STATE_DIR}/install.env"
@@ -29,6 +30,8 @@ HTTPS_ACTIVE="${HASHCAKE_HTTPS_ACTIVE:-}"
 
 UPDATE_MANIFEST_URL="${HASHCAKE_UPDATE_MANIFEST_URL:-}"
 DOWNLOAD_SHA256="${HASHCAKE_DOWNLOAD_SHA256:-}"
+MANIFEST_URL="${HASHCAKE_MANIFEST_URL:-}"
+DOWNLOAD_MANIFEST_SHA256="${HASHCAKE_MANIFEST_SHA256:-}"
 RUST_LOG_VALUE="${RUST_LOG:-hashcake=info}"
 BUILD_FEATURES="${HASHCAKE_FEATURES:-admin-spa}"
 START_AFTER_INSTALL="${HASHCAKE_START_AFTER_INSTALL:-1}"
@@ -165,9 +168,17 @@ validate_runtime_inputs() {
       *[[:space:]]*) die "HASHCAKE_DOWNLOAD_URL 不能包含空白字符" ;;
     esac
   fi
+  if [ -n "${MANIFEST_URL}" ]; then
+    case "${MANIFEST_URL}" in https://*) ;; *) die "HASHCAKE_MANIFEST_URL 必须使用 https://" ;; esac
+    case "${MANIFEST_URL}" in *[[:space:]]*) die "HASHCAKE_MANIFEST_URL 不能包含空白字符" ;; esac
+  fi
   if [ -n "${DOWNLOAD_SHA256}" ] \
     && { [ "${#DOWNLOAD_SHA256}" -ne 64 ] || [[ "${DOWNLOAD_SHA256}" == *[!0-9A-Fa-f]* ]]; }; then
     die "HASHCAKE_DOWNLOAD_SHA256 必须是 64 位十六进制 SHA-256"
+  fi
+  if [ -n "${DOWNLOAD_MANIFEST_SHA256}" ] \
+    && { [ "${#DOWNLOAD_MANIFEST_SHA256}" -ne 64 ] || [[ "${DOWNLOAD_MANIFEST_SHA256}" == *[!0-9A-Fa-f]* ]]; }; then
+    die "HASHCAKE_MANIFEST_SHA256 必须是 64 位十六进制 SHA-256"
   fi
 
   validate_safe_absolute_path "${INSTALL_DIR}" "安装目录"
@@ -177,6 +188,7 @@ validate_runtime_inputs() {
   validate_safe_absolute_path "${LOG_DIR}" "日志目录"
   validate_safe_absolute_path "${BACKUP_DIR}" "备份目录"
   validate_safe_absolute_path "${INSTALLER_STATE_DIR}" "安装元数据目录"
+  validate_safe_absolute_path "${MANIFEST_PATH}" "HashCake manifest 路径"
 }
 
 preflight_install_or_update() {
@@ -241,6 +253,10 @@ run_as_service_user() {
   [ "${current_uid}" = "0" ] || die "该操作需要 root 或 ${SERVICE_USER} 用户权限"
   command -v runuser >/dev/null 2>&1 || die "缺少 runuser，无法以 ${SERVICE_USER} 身份安全写入运行状态"
   runuser -u "${SERVICE_USER}" -- "$@"
+}
+
+run_hashcake_as_service_user() {
+  run_as_service_user env HASHCAKE_ENVELOPE_EXEC_DIR="${STATE_DIR}" "$@"
 }
 
 random_secret() {
@@ -733,7 +749,9 @@ FIREWALL_SNAPSHOT_DIR=""
 FIREWALL_ROLLBACK_ARMED=0
 INSTALL_TRANSACTION_ACTIVE=0
 INSTALL_TRANSACTION_DIR=""
+INSTALL_CANDIDATE_DIR=""
 TXN_HAD_BINARY=0
+TXN_HAD_MANIFEST=0
 TXN_HAD_SERVICE=0
 TXN_HAD_INSTALL_ENV=0
 TXN_HAD_LEGACY_INSTALL_ENV=0
@@ -742,7 +760,302 @@ TXN_HAD_CONFIG=0
 TXN_SERVICE_WAS_ENABLED=0
 TXN_SERVICE_WAS_ACTIVE=0
 TXN_BINARY_CHANGED=0
+TXN_MANIFEST_CHANGED=0
 TXN_SERVICE_CHANGED=0
+
+cleanup_install_candidate() {
+  if [ -n "${INSTALL_CANDIDATE_DIR}" ]; then
+    rm -rf -- "${INSTALL_CANDIDATE_DIR}"
+    INSTALL_CANDIDATE_DIR=""
+  fi
+}
+
+write_install_transaction_journal() {
+  python3 - "${INSTALL_TRANSACTION_DIR}" \
+    "${TXN_HAD_BINARY}" "${TXN_HAD_MANIFEST}" "${TXN_HAD_SERVICE}" \
+    "${TXN_HAD_INSTALL_ENV}" "${TXN_HAD_LEGACY_INSTALL_ENV}" \
+    "${TXN_HAD_ADMIN_JSON}" "${TXN_HAD_CONFIG}" \
+    "${TXN_SERVICE_WAS_ENABLED}" "${TXN_SERVICE_WAS_ACTIVE}" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+directory = Path(sys.argv[1])
+keys = [
+    "had_binary", "had_manifest", "had_service", "had_install_env",
+    "had_legacy_install_env", "had_admin_json", "had_config",
+    "service_was_enabled", "service_was_active",
+]
+values = [int(value) for value in sys.argv[2:]]
+if any(value not in (0, 1) for value in values):
+    raise SystemExit("invalid install transaction flag")
+payload = {"schema_version": 1, **dict(zip(keys, values))}
+# Backups must reach disk before phase-active makes recovery authoritative.
+for child in directory.iterdir():
+    if child.is_file() and not child.is_symlink():
+        fd = os.open(child, os.O_RDONLY)
+        os.fsync(fd)
+        os.close(fd)
+tmp = directory / ".journal.tmp"
+journal = directory / "journal.json"
+with open(tmp, "x", encoding="utf-8") as handle:
+    os.chmod(tmp, 0o600)
+    json.dump(payload, handle, sort_keys=True)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.replace(tmp, journal)
+phase = directory / "phase-active"
+fd = os.open(phase, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+os.fsync(fd)
+os.close(fd)
+dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+os.fsync(dir_fd)
+os.close(dir_fd)
+parent_fd = os.open(directory.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+os.fsync(parent_fd)
+os.close(parent_fd)
+PY
+}
+
+mark_install_transaction_committed() {
+  python3 - "${INSTALL_TRANSACTION_DIR}" \
+    "${BIN_PATH}" "${MANIFEST_PATH}" "${SERVICE_FILE}" "${INSTALL_ENV}" \
+    "${LEGACY_INSTALL_ENV}" "${STATE_DIR}/admin.json" "${CONFIG_FILE}" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+directory = Path(sys.argv[1])
+parents = {directory}
+for raw in sys.argv[2:]:
+    path = Path(raw)
+    parents.add(path.parent)
+    if path.exists() and path.is_file() and not path.is_symlink():
+        fd = os.open(path, os.O_RDONLY)
+        os.fsync(fd)
+        os.close(fd)
+for parent in parents:
+    if parent.exists():
+        fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        os.fsync(fd)
+        os.close(fd)
+phase = directory / "phase-committed"
+fd = os.open(phase, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+os.fsync(fd)
+os.close(fd)
+dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+os.fsync(dir_fd)
+os.close(dir_fd)
+PY
+}
+
+sync_install_transaction_targets() {
+  python3 - "${BIN_PATH}" "${MANIFEST_PATH}" "${SERVICE_FILE}" "${INSTALL_ENV}" \
+    "${LEGACY_INSTALL_ENV}" "${STATE_DIR}/admin.json" "${CONFIG_FILE}" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+parents = set()
+for raw in sys.argv[1:]:
+    path = Path(raw)
+    parents.add(path.parent)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        continue
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise SystemExit(f"install transaction target is not a safe regular file: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        if opened.st_dev != info.st_dev or opened.st_ino != info.st_ino:
+            raise SystemExit(f"install transaction target changed while syncing: {path}")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+for parent in sorted(parents, key=lambda item: str(item)):
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(parent, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+PY
+}
+
+durably_remove_install_transaction() {
+  local txn="$1" parent
+  [ -n "${txn}" ] || return 0
+  case "${txn}" in
+    "${BACKUP_DIR}"/.install-transaction.*) ;;
+    *) warn "拒绝清理备份目录外的安装事务：${txn}"; return 1 ;;
+  esac
+  [ ! -L "${txn}" ] || { warn "拒绝清理符号链接安装事务：${txn}"; return 1; }
+  parent="$(dirname -- "${txn}")"
+  rm -rf -- "${txn}" || return 1
+  python3 - "${parent}" <<'PY'
+import os
+import sys
+
+fd = os.open(sys.argv[1], os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+}
+
+restore_install_transaction_systemd_state() {
+  local failed=0
+  has_systemd || return 0
+  systemctl daemon-reload >/dev/null 2>&1 || failed=1
+  if [ "${TXN_SERVICE_WAS_ENABLED}" = "1" ]; then
+    systemctl enable "${SERVICE_NAME}.service" >/dev/null 2>&1 || failed=1
+    systemctl is-enabled --quiet "${SERVICE_NAME}.service" 2>/dev/null || failed=1
+  else
+    systemctl disable "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
+    if systemctl is-enabled --quiet "${SERVICE_NAME}.service" 2>/dev/null; then
+      failed=1
+    fi
+  fi
+  if [ "${TXN_SERVICE_WAS_ACTIVE}" = "1" ]; then
+    restart_service_checked >/dev/null 2>&1 || failed=1
+  elif systemctl is-active --quiet "${SERVICE_NAME}.service" 2>/dev/null; then
+    failed=1
+  fi
+  [ "${failed}" = "0" ]
+}
+
+recover_orphan_install_transactions() {
+  local txn marker fields=() failed expected_uid mode owner journal_output active_list
+  local -a active_txns=()
+  expected_uid="$(id -u)"
+
+  # A single active journal has an unambiguous rollback target. Multiple active
+  # journals can exist after repeated kill -9 interruptions on an older
+  # installer that did not recover before starting maintenance. Their random
+  # mktemp names do not encode nesting order, so applying them in glob order
+  # could restore the wrong generation. Detect that state before changing any
+  # file and preserve every journal for explicit recovery.
+  for txn in "${BACKUP_DIR}"/.install-transaction.*; do
+    [ -d "${txn}" ] || continue
+    [ ! -L "${txn}" ] || die "安装事务恢复拒绝符号链接：${txn}"
+    read -r owner mode < <(python3 - "${txn}" <<'PY'
+import os, stat, sys
+info = os.lstat(sys.argv[1])
+print(info.st_uid, oct(stat.S_IMODE(info.st_mode))[2:])
+PY
+    )
+    [ "${owner}" = "${expected_uid}" ] \
+      || die "安装事务目录所有者异常：${txn}"
+    [ "${mode}" = "700" ] || die "安装事务目录权限必须为 700：${txn}"
+    for marker in phase-active phase-committed; do
+      if [ -e "${txn}/${marker}" ] || [ -L "${txn}/${marker}" ]; then
+        [ -f "${txn}/${marker}" ] && [ ! -L "${txn}/${marker}" ] \
+          || die "安装事务阶段标记必须是普通非符号链接文件：${txn}/${marker}"
+      fi
+    done
+    if [ ! -f "${txn}/phase-committed" ] && [ -f "${txn}/phase-active" ]; then
+      active_txns+=("${txn}")
+    fi
+  done
+  if [ "${#active_txns[@]}" -gt 1 ]; then
+    printf -v active_list ' %q' "${active_txns[@]}"
+    die "检测到多个未提交的活动安装事务，无法安全判断回滚顺序；已完整保留现场：${active_list# }"
+  fi
+
+  for txn in "${BACKUP_DIR}"/.install-transaction.*; do
+    [ -d "${txn}" ] || continue
+    [ ! -L "${txn}" ] || die "安装事务恢复拒绝符号链接：${txn}"
+    read -r owner mode < <(python3 - "${txn}" <<'PY'
+import os, stat, sys
+info = os.lstat(sys.argv[1])
+print(info.st_uid, oct(stat.S_IMODE(info.st_mode))[2:])
+PY
+    )
+    [ "${owner}" = "${expected_uid}" ] \
+      || die "安装事务目录所有者异常：${txn}"
+    [ "${mode}" = "700" ] || die "安装事务目录权限必须为 700：${txn}"
+    if [ -f "${txn}/phase-committed" ]; then
+      durably_remove_install_transaction "${txn}" \
+        || die "无法持久清理已提交安装事务：${txn}"
+      continue
+    fi
+    if [ ! -f "${txn}/phase-active" ]; then
+      warn "清理尚未进入文件替换阶段的残留安装事务：${txn}"
+      durably_remove_install_transaction "${txn}" \
+        || die "无法持久清理未激活安装事务：${txn}"
+      continue
+    fi
+    if [ ! -f "${txn}/journal.json" ] || [ -L "${txn}/journal.json" ]; then
+      die "活动安装事务缺少安全 journal：${txn}"
+    fi
+    if ! journal_output="$(python3 - "${txn}/journal.json" <<'PY'
+import json
+import sys
+
+expected = [
+    "had_binary", "had_manifest", "had_service", "had_install_env",
+    "had_legacy_install_env", "had_admin_json", "had_config",
+    "service_was_enabled", "service_was_active",
+]
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle)
+if set(value) != set(["schema_version"] + expected) or value["schema_version"] != 1:
+    raise SystemExit("invalid install transaction journal schema")
+for key in expected:
+    if value[key] not in (0, 1):
+        raise SystemExit(f"invalid {key}")
+    print(value[key])
+PY
+    )"; then
+      die "无法解析安装事务 journal：${txn}"
+    fi
+    fields=()
+    while IFS= read -r value; do fields+=("${value}"); done <<< "${journal_output}"
+    [ "${#fields[@]}" -eq 9 ] || die "安装事务 journal 字段数量错误：${txn}"
+
+    warn "发现上次未提交的安装事务，恢复 binary + manifest + 配置：${txn}"
+    INSTALL_TRANSACTION_DIR="${txn}"
+    TXN_HAD_BINARY="${fields[0]}"
+    TXN_HAD_MANIFEST="${fields[1]}"
+    TXN_HAD_SERVICE="${fields[2]}"
+    TXN_HAD_INSTALL_ENV="${fields[3]}"
+    TXN_HAD_LEGACY_INSTALL_ENV="${fields[4]}"
+    TXN_HAD_ADMIN_JSON="${fields[5]}"
+    TXN_HAD_CONFIG="${fields[6]}"
+    TXN_SERVICE_WAS_ENABLED="${fields[7]}"
+    TXN_SERVICE_WAS_ACTIVE="${fields[8]}"
+    failed=0
+    if has_systemd; then
+      systemctl stop "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
+    fi
+    restore_transaction_file "${BIN_PATH}" binary "${TXN_HAD_BINARY}" || failed=1
+    restore_transaction_file "${MANIFEST_PATH}" manifest "${TXN_HAD_MANIFEST}" || failed=1
+    restore_transaction_file "${SERVICE_FILE}" service "${TXN_HAD_SERVICE}" || failed=1
+    restore_transaction_file "${INSTALL_ENV}" install-env "${TXN_HAD_INSTALL_ENV}" || failed=1
+    restore_transaction_file "${LEGACY_INSTALL_ENV}" legacy-install-env "${TXN_HAD_LEGACY_INSTALL_ENV}" || failed=1
+    restore_transaction_file "${STATE_DIR}/admin.json" admin-json "${TXN_HAD_ADMIN_JSON}" || failed=1
+    restore_transaction_file "${CONFIG_FILE}" config "${TXN_HAD_CONFIG}" || failed=1
+    sync_install_transaction_targets || failed=1
+    restore_install_transaction_systemd_state || failed=1
+    [ "${failed}" = "0" ] || die "未提交安装事务自动恢复不完整：${txn}"
+    cleanup_install_transaction \
+      || die "恢复完成但无法持久清理安装事务：${txn}"
+    ok "已恢复上次中断前的完整发布文件与配置"
+  done
+}
+
+prepare_install_transaction_environment() {
+  ensure_dirs
+  recover_orphan_install_transactions
+}
 
 backup_transaction_file() {
   local path="$1" name="$2" flag_name="$3"
@@ -777,6 +1090,7 @@ restore_transaction_file() {
 begin_install_transaction() {
   [ "${INSTALL_TRANSACTION_ACTIVE}" = "0" ] || die "安装事务已经启动"
   TXN_HAD_BINARY=0
+  TXN_HAD_MANIFEST=0
   TXN_HAD_SERVICE=0
   TXN_HAD_INSTALL_ENV=0
   TXN_HAD_LEGACY_INSTALL_ENV=0
@@ -785,11 +1099,13 @@ begin_install_transaction() {
   TXN_SERVICE_WAS_ENABLED=0
   TXN_SERVICE_WAS_ACTIVE=0
   TXN_BINARY_CHANGED=0
+  TXN_MANIFEST_CHANGED=0
   TXN_SERVICE_CHANGED=0
   INSTALL_TRANSACTION_DIR="$(mktemp -d "${BACKUP_DIR}/.install-transaction.XXXXXX")"
   chmod 700 "${INSTALL_TRANSACTION_DIR}"
 
   backup_transaction_file "${BIN_PATH}" binary TXN_HAD_BINARY
+  backup_transaction_file "${MANIFEST_PATH}" manifest TXN_HAD_MANIFEST
   backup_transaction_file "${SERVICE_FILE}" service TXN_HAD_SERVICE
   backup_transaction_file "${INSTALL_ENV}" install-env TXN_HAD_INSTALL_ENV
   backup_transaction_file "${LEGACY_INSTALL_ENV}" legacy-install-env TXN_HAD_LEGACY_INSTALL_ENV
@@ -803,6 +1119,8 @@ begin_install_transaction() {
     TXN_SERVICE_WAS_ACTIVE=1
   fi
   INSTALL_TRANSACTION_ACTIVE=1
+  write_install_transaction_journal \
+    || { INSTALL_TRANSACTION_ACTIVE=0; cleanup_install_transaction; die "无法持久化安装事务 journal"; }
   trap 'install_exit_guard "$?"' EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
@@ -810,7 +1128,7 @@ begin_install_transaction() {
 
 cleanup_install_transaction() {
   if [ -n "${INSTALL_TRANSACTION_DIR}" ]; then
-    rm -rf -- "${INSTALL_TRANSACTION_DIR}"
+    durably_remove_install_transaction "${INSTALL_TRANSACTION_DIR}" || return 1
     INSTALL_TRANSACTION_DIR=""
   fi
 }
@@ -819,17 +1137,21 @@ rollback_install_transaction() {
   local failed=0
   [ "${INSTALL_TRANSACTION_ACTIVE}" = "1" ] || return 0
   warn "安装或更新未完成，正在恢复执行前状态"
+  cleanup_install_candidate
 
   if [ "${FIREWALL_ROLLBACK_ARMED}" = "1" ]; then
     restore_firewall_state || failed=1
     FIREWALL_ROLLBACK_ARMED=0
   fi
-  if has_systemd && { [ "${TXN_BINARY_CHANGED}" = "1" ] || [ "${TXN_SERVICE_CHANGED}" = "1" ]; }; then
+  if has_systemd && { [ "${TXN_BINARY_CHANGED}" = "1" ] || [ "${TXN_MANIFEST_CHANGED}" = "1" ] || [ "${TXN_SERVICE_CHANGED}" = "1" ]; }; then
     systemctl stop "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
   fi
 
   if [ "${TXN_BINARY_CHANGED}" = "1" ]; then
     restore_transaction_file "${BIN_PATH}" binary "${TXN_HAD_BINARY}" || failed=1
+  fi
+  if [ "${TXN_MANIFEST_CHANGED}" = "1" ]; then
+    restore_transaction_file "${MANIFEST_PATH}" manifest "${TXN_HAD_MANIFEST}" || failed=1
   fi
   if [ "${TXN_SERVICE_CHANGED}" = "1" ]; then
     restore_transaction_file "${SERVICE_FILE}" service "${TXN_HAD_SERVICE}" || failed=1
@@ -838,29 +1160,19 @@ rollback_install_transaction() {
   restore_transaction_file "${LEGACY_INSTALL_ENV}" legacy-install-env "${TXN_HAD_LEGACY_INSTALL_ENV}" || failed=1
   restore_transaction_file "${STATE_DIR}/admin.json" admin-json "${TXN_HAD_ADMIN_JSON}" || failed=1
   restore_transaction_file "${CONFIG_FILE}" config "${TXN_HAD_CONFIG}" || failed=1
+  sync_install_transaction_targets || failed=1
 
-  if has_systemd; then
-    systemctl daemon-reload >/dev/null 2>&1 || failed=1
-    if [ "${TXN_SERVICE_WAS_ENABLED}" = "1" ]; then
-      systemctl enable "${SERVICE_NAME}.service" >/dev/null 2>&1 || failed=1
-    else
-      systemctl disable "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
-    fi
-    if [ "${TXN_SERVICE_WAS_ACTIVE}" = "1" ]; then
-      if ! restart_service_checked >/dev/null 2>&1; then
-        warn "已恢复旧文件，但 ${SERVICE_NAME}.service 未能稳定恢复运行"
-        failed=1
-      fi
-    fi
-  fi
+  restore_install_transaction_systemd_state || failed=1
 
   cleanup_firewall_snapshot
-  cleanup_install_transaction
+  if [ "${failed}" = "0" ]; then
+    cleanup_install_transaction || failed=1
+  fi
   INSTALL_TRANSACTION_ACTIVE=0
   if [ "${failed}" = "0" ]; then
-    ok "已恢复执行前的二进制、服务和安装配置"
+    ok "已恢复执行前的二进制、manifest、服务和安装配置"
   else
-    warn "自动恢复不完整，请检查 ${BIN_PATH} 和 ${SERVICE_FILE}"
+    warn "自动恢复不完整，请检查 ${BIN_PATH} 和 ${SERVICE_FILE}；未提交事务已保留：${INSTALL_TRANSACTION_DIR}"
   fi
 }
 
@@ -869,7 +1181,9 @@ commit_install_transaction() {
   if [ "${FIREWALL_ROLLBACK_ARMED}" = "1" ]; then
     commit_firewall_change
   fi
+  mark_install_transaction_committed
   INSTALL_TRANSACTION_ACTIVE=0
+  cleanup_install_candidate
   cleanup_install_transaction
   trap - EXIT INT TERM
 }
@@ -1417,6 +1731,21 @@ repo_asset_sha256() {
   printf '%s' "${expected}"
 }
 
+repo_asset_sha256_optional() {
+  local asset_path="$1" sums_file expected
+  sums_file="$(mktemp "${INSTALL_DIR}/.SHA256SUMS.XXXXXX")"
+  if ! download_repo_file "${RELEASE_SUMS_PATH}" "${sums_file}"; then
+    rm -f -- "${sums_file}"
+    return 1
+  fi
+  expected="$(awk -v wanted="${asset_path}" '$2 == wanted { print $1; exit }' "${sums_file}")"
+  rm -f -- "${sums_file}"
+  if [ "${#expected}" -ne 64 ] || [[ "${expected}" == *[!0-9A-Fa-f]* ]]; then
+    return 1
+  fi
+  printf '%s' "${expected}"
+}
+
 asset_name_for_version() {
   local prefix="$1"
   if [ "${RELEASE_TAG}" != "latest" ]; then
@@ -1635,7 +1964,8 @@ build_hashcake() {
 }
 
 download_hashcake() {
-  local dst="$1" download_path="${1}.download" expected_sha=""
+  local dst="$1" manifest_dst="$2" download_path="${1}.download" expected_sha=""
+  local manifest_download="${2}.download" manifest_sha="" manifest_asset=""
   local url="${HASHCAKE_DOWNLOAD_URL:-}"
   command -v curl >/dev/null 2>&1 || die "缺少 curl，无法下载 HASHCAKE_DOWNLOAD_URL"
   if [ -z "${url}" ]; then
@@ -1658,6 +1988,13 @@ download_hashcake() {
       rm -f -- "${download_path}"
       die "无法取得 HashCake 发布文件的 SHA-256 校验值"
     fi
+    manifest_asset="${asset}.manifest.json"
+    if manifest_sha="$(repo_asset_sha256_optional "${RELEASE_PLATFORM}/${manifest_asset}")"; then
+      if ! download_repo_file "${RELEASE_PLATFORM}/${manifest_asset}" "${manifest_download}"; then
+        rm -f -- "${download_path}" "${manifest_download}"
+        die "signed manifest 已列入 SHA256SUMS，但下载失败"
+      fi
+    fi
   else
     log "从自定义 HASHCAKE_DOWNLOAD_URL 下载 hashcake 二进制（地址已隐藏）"
     if ! download_url_file "${url}" "${download_path}"; then
@@ -1668,16 +2005,34 @@ download_hashcake() {
     if [ -z "${expected_sha}" ]; then
       warn "自定义 HASHCAKE_DOWNLOAD_URL 未提供 HASHCAKE_DOWNLOAD_SHA256，只能执行二进制启动检查"
     fi
+    if [ -n "${MANIFEST_URL}" ]; then
+      if ! download_url_file "${MANIFEST_URL}" "${manifest_download}"; then
+        rm -f -- "${download_path}" "${manifest_download}"
+        die "下载 HASHCAKE_MANIFEST_URL 失败"
+      fi
+      manifest_sha="${DOWNLOAD_MANIFEST_SHA256}"
+      [ -n "${manifest_sha}" ] \
+        || warn "自定义 manifest 未提供 HASHCAKE_MANIFEST_SHA256，将由候选二进制执行签名验证"
+    fi
   fi
   if [ -n "${expected_sha}" ] && ! verify_file_sha256 "${download_path}" "${expected_sha}"; then
     rm -f -- "${download_path}"
     die "HashCake 下载文件校验失败，候选文件已删除"
   fi
+  if [ -f "${manifest_download}" ] && [ -n "${manifest_sha}" ] \
+    && ! verify_file_sha256 "${manifest_download}" "${manifest_sha}"; then
+    rm -f -- "${download_path}" "${manifest_download}"
+    die "HashCake manifest 下载校验失败"
+  fi
   if ! install -m 0755 "${download_path}" "${dst}"; then
     rm -f -- "${download_path}"
     die "无法准备 HashCake 候选二进制"
   fi
-  rm -f -- "${download_path}"
+  if [ -f "${manifest_download}" ]; then
+    install -m 0644 "${manifest_download}" "${manifest_dst}" \
+      || { rm -f -- "${download_path}" "${manifest_download}"; die "无法准备 HashCake 候选 manifest"; }
+  fi
+  rm -f -- "${download_path}" "${manifest_download}"
   return 0
 }
 
@@ -1709,7 +2064,7 @@ assert_config_accepted_by_candidate() {
   # 后者会把子命令自身的任何异常（panic、依赖缺失、被 seccomp 拦下）一并解释成
   # 「不支持」而静默放行。`--version` 已在上面跑通，所以 `--help` 再失败属于真故障。
   local help_output
-  help_output="$(run_as_service_user "${candidate_bin}" --help 2>&1)" \
+  help_output="$(run_hashcake_as_service_user "${candidate_bin}" --help 2>&1)" \
     || die "候选 HashCake 二进制无法输出帮助信息，已中止本次变更"
   case "${help_output}" in
     *check-config*) ;;
@@ -1718,15 +2073,21 @@ assert_config_accepted_by_candidate() {
       return 0
       ;;
   esac
-  if ! probe_output="$(run_as_service_user "${candidate_bin}" check-config --config "${CONFIG_FILE}" 2>&1)"; then
+  if ! probe_output="$(run_hashcake_as_service_user "${candidate_bin}" check-config --config "${CONFIG_FILE}" 2>&1)"; then
     printf '%s\n' "${probe_output}" >&2
     return 1
   fi
   printf '%s\n' "${probe_output}"
 }
 
+extract_hashcake_version() {
+  printf '%s\n' "$1" \
+    | awk '$1 == "hashcake" && NF == 2 { print $2; exit }'
+}
+
 install_binary() {
-  local src="${HASHCAKE_BIN_SOURCE:-}" candidate source_label version_output actual_version
+  local src="${HASHCAKE_BIN_SOURCE:-}" candidate_dir candidate candidate_manifest
+  local source_manifest source_label version_output actual_version
   EXPECTED_BINARY_VERSION=""
   if [ "${RELEASE_TAG}" != "latest" ]; then
     EXPECTED_BINARY_VERSION="${RELEASE_TAG#v}"
@@ -1736,14 +2097,27 @@ install_binary() {
   if [ -e "${BIN_PATH}" ] && [ ! -f "${BIN_PATH}" ]; then
     die "HashCake 二进制路径不是普通文件：${BIN_PATH}"
   fi
-  candidate="$(mktemp "${INSTALL_DIR}/.hashcake.candidate.XXXXXX")"
-  rm -f -- "${candidate}"
+  validate_root_controlled_parent "${MANIFEST_PATH}" "HashCake manifest"
+  candidate_dir="$(mktemp -d "${INSTALL_DIR}/.hashcake-candidate.XXXXXX")"
+  INSTALL_CANDIDATE_DIR="${candidate_dir}"
+  chmod 0755 "${candidate_dir}"
+  candidate="${candidate_dir}/hashcake"
+  candidate_manifest="${candidate}.manifest.json"
   if [ -n "${src}" ]; then
-    [ -x "${src}" ] || die "HASHCAKE_BIN_SOURCE 不存在或不可执行：${src}"
-    [ ! -L "${src}" ] || die "HASHCAKE_BIN_SOURCE 不能是符号链接：${src}"
+    [ -x "${src}" ] || { rm -rf -- "${candidate_dir}"; die "HASHCAKE_BIN_SOURCE 不存在或不可执行：${src}"; }
+    [ ! -L "${src}" ] || { rm -rf -- "${candidate_dir}"; die "HASHCAKE_BIN_SOURCE 不能是符号链接：${src}"; }
     install -m 0755 "${src}" "${candidate}"
+    source_manifest="${HASHCAKE_MANIFEST_SOURCE:-${src}.manifest.json}"
+    if [ -n "${HASHCAKE_MANIFEST_SOURCE:-}" ] && [ ! -f "${source_manifest}" ]; then
+      rm -rf -- "${candidate_dir}"
+      die "HASHCAKE_MANIFEST_SOURCE 不存在：${source_manifest}"
+    fi
+    if [ -f "${source_manifest}" ]; then
+      [ ! -L "${source_manifest}" ] || { rm -rf -- "${candidate_dir}"; die "HashCake manifest 不能是符号链接"; }
+      install -m 0644 "${source_manifest}" "${candidate_manifest}"
+    fi
     source_label="指定二进制"
-  elif download_hashcake "${candidate}"; then
+  elif download_hashcake "${candidate}" "${candidate_manifest}"; then
     source_label="下载的二进制"
   else
     build_hashcake
@@ -1752,24 +2126,30 @@ install_binary() {
   fi
 
   chown root:root "${candidate}"
+  if [ -f "${candidate_manifest}" ]; then
+    chmod 0644 "${candidate_manifest}"
+    chown root:root "${candidate_manifest}"
+  fi
   if command_exists timeout; then
-    if ! version_output="$(run_as_service_user timeout 15 "${candidate}" --version 2>&1)"; then
-      rm -f -- "${candidate}"
+    if ! version_output="$(run_hashcake_as_service_user timeout 15 "${candidate}" --version 2>&1)"; then
+      rm -rf -- "${candidate_dir}"
       die "HashCake 候选二进制无法正常执行，防火墙尚未修改。原始错误：
 ${version_output:-未返回错误详情。请检查 CPU 架构和 GLIBC 版本。}"
     fi
   else
-    if ! version_output="$(run_as_service_user "${candidate}" --version 2>&1)"; then
-      rm -f -- "${candidate}"
+    if ! version_output="$(run_hashcake_as_service_user "${candidate}" --version 2>&1)"; then
+      rm -rf -- "${candidate_dir}"
       die "HashCake 候选二进制无法正常执行，防火墙尚未修改。原始错误：
 ${version_output:-未返回错误详情。请检查 CPU 架构和 GLIBC 版本。}"
     fi
   fi
   [ -n "${version_output}" ] \
-    || { rm -f -- "${candidate}"; die "HashCake 候选二进制执行成功但没有返回版本号"; }
-  actual_version="$(printf '%s\n' "${version_output}" | awk 'NR == 1 { print $NF }')"
+    || { rm -rf -- "${candidate_dir}"; die "HashCake 候选二进制执行成功但没有返回版本号"; }
+  actual_version="$(extract_hashcake_version "${version_output}")"
+  [ -n "${actual_version}" ] \
+    || { rm -rf -- "${candidate_dir}"; die "HashCake 候选二进制没有返回有效的 hashcake <版本号> 输出"; }
   if [ -n "${EXPECTED_BINARY_VERSION}" ] && [ "${actual_version}" != "${EXPECTED_BINARY_VERSION}" ]; then
-    rm -f -- "${candidate}"
+    rm -rf -- "${candidate_dir}"
     die "HashCake 候选二进制版本不匹配：期望 ${EXPECTED_BINARY_VERSION}，实际 ${actual_version:-未知}"
   fi
   # 最后一道门：候选二进制必须接受当前已落盘的配置。放在 mv 之前，失败时旧二进制
@@ -1780,7 +2160,7 @@ ${version_output:-未返回错误详情。请检查 CPU 架构和 GLIBC 版本�
   # 就会为被删掉的那条产出 Removed，当场拆掉在线端口。让运维在不知情的情况下触发它，
   # 比这次升级失败本身更糟。
   if ! assert_config_accepted_by_candidate "${candidate}"; then
-    rm -f -- "${candidate}"
+    rm -rf -- "${candidate_dir}"
     die "新版本拒绝当前配置 ${CONFIG_FILE}；已中止本次变更，旧二进制与运行中的服务均未改动。
 修复步骤（请按顺序，不要在服务运行时直接改配置）：
   1) systemctl stop ${SERVICE_NAME}
@@ -1788,11 +2168,29 @@ ${version_output:-未返回错误详情。请检查 CPU 架构和 GLIBC 版本�
   3) 重新执行本次更新
 当前运行的旧版本对这类配置错误存在已知的热重载缺陷：在线保存配置可能立即断开该端口上的矿机。"
   fi
-  mv -fT "${candidate}" "${BIN_PATH}"
+  [ "${INSTALL_TRANSACTION_ACTIVE}" = "1" ] \
+    || { rm -rf -- "${candidate_dir}"; die "二进制/manifest 替换必须在安装事务内执行"; }
+  if has_systemd && systemctl is-active --quiet "${SERVICE_NAME}.service" 2>/dev/null; then
+    log "候选文件已通过预检，停止服务后成组替换 binary + manifest"
+    systemctl stop "${SERVICE_NAME}.service" \
+      || { rm -rf -- "${candidate_dir}"; die "无法停止 ${SERVICE_NAME}.service，未替换发布文件"; }
+  fi
+  if [ -f "${candidate_manifest}" ]; then
+    TXN_MANIFEST_CHANGED=1
+    mv -fT "${candidate_manifest}" "${MANIFEST_PATH}"
+    chmod 0644 "${MANIFEST_PATH}"
+    chown root:root "${MANIFEST_PATH}"
+  elif [ -e "${MANIFEST_PATH}" ]; then
+    TXN_MANIFEST_CHANGED=1
+    rm -f -- "${MANIFEST_PATH}"
+  fi
   TXN_BINARY_CHANGED=1
+  mv -fT "${candidate}" "${BIN_PATH}"
   chmod 755 "${BIN_PATH}"
   chown root:root "${BIN_PATH}"
-  ok "已原子安装${source_label} ${BIN_PATH}（${version_output}）"
+  rm -rf -- "${candidate_dir}"
+  INSTALL_CANDIDATE_DIR=""
+  ok "已成组安装${source_label} binary + manifest（hashcake ${actual_version}）"
 }
 
 write_service() {
@@ -1843,6 +2241,7 @@ User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
 WorkingDirectory=${INSTALL_DIR}
 Environment="RUST_LOG=${RUST_LOG_VALUE}"
+Environment="HASHCAKE_ENVELOPE_EXEC_DIR=${STATE_DIR}"
 ExecStart=${BIN_PATH} --config ${CONFIG_FILE} --no-tui --token-store ${STATE_DIR}/tokens.json --log-dir ${LOG_DIR} --log-file-prefix hashcake-debug.log${admin_args}${update_args}
 Restart=always
 RestartSec=2
@@ -1871,7 +2270,7 @@ SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
-ReadOnlyPaths=${BIN_PATH}
+ReadOnlyPaths=${BIN_PATH} -${MANIFEST_PATH}
 ReadWritePaths=${CONFIG_DIR} ${STATE_DIR} ${LOG_DIR}
 StandardOutput=append:${LOG_DIR}/hashcake.service.log
 StandardError=append:${LOG_DIR}/hashcake.err.log
@@ -1887,8 +2286,8 @@ EOF
       die "systemd 服务校验失败，防火墙尚未修改"
     fi
   fi
-  mv -fT "${service_tmp}" "${SERVICE_FILE}"
   TXN_SERVICE_CHANGED=1
+  mv -fT "${service_tmp}" "${SERVICE_FILE}"
   systemctl daemon-reload
   ok "已写入 systemd 服务 ${SERVICE_FILE}"
 }
@@ -1898,7 +2297,7 @@ print_install_result() {
   cat <<EOF
 
 ========== HashCake 安装结果 ==========
-当前版本: $([ -x "${BIN_PATH}" ] && "${BIN_PATH}" --version 2>/dev/null || printf '未知')
+当前版本: $([ -x "${BIN_PATH}" ] && run_hashcake_as_service_user "${BIN_PATH}" --version 2>/dev/null || printf '未知')
 后台访问地址: $(admin_url)
 EOF
   if [ -n "${token}" ]; then
@@ -1925,6 +2324,7 @@ EOF
 install_service() {
   local admin_state needs_bootstrap=0 bootstrap_log_start=1 token=""
   preflight_install_or_update
+  prepare_install_transaction_environment
   if is_complete_install; then
     die "检测到已安装 HashCake，请使用 update 更新程序"
   fi
@@ -1932,7 +2332,6 @@ install_service() {
     warn "检测到上次未完成的安装文件，将在事务保护下继续修复首次安装"
   fi
   check_no_running_conflict
-  ensure_dirs
   begin_install_transaction
   configure_web_defaults_for_install
   validate_admin_bind_for_install
@@ -1981,8 +2380,8 @@ install_service() {
 
 update_service() {
   preflight_install_or_update
+  prepare_install_transaction_environment
   is_installed || die "未检测到已安装 HashCake，请先执行 install 首次安装"
-  ensure_dirs
   begin_install_transaction
   configure_web_defaults_for_update
   ensure_metrics_token
@@ -2002,7 +2401,7 @@ update_service() {
   cat <<EOF
 
 ========== HashCake 更新结果 ==========
-当前版本: $([ -x "${BIN_PATH}" ] && "${BIN_PATH}" --version 2>/dev/null || printf '未知')
+当前版本: $([ -x "${BIN_PATH}" ] && run_hashcake_as_service_user "${BIN_PATH}" --version 2>/dev/null || printf '未知')
 后台访问地址: $(admin_url)
 安全访问路径: /${URL_PREFIX}/
 提示: 更新已保留 Web 端口、安全访问路径、账号、令牌、配置和状态目录，并重新确认整机防火墙已关闭。
@@ -2183,8 +2582,8 @@ EOF
 
 change_web_settings() {
   preflight_install_or_update
+  prepare_install_transaction_environment
   is_complete_install || die "HashCake 安装不完整，请先执行 install 修复或 update 更新"
-  ensure_dirs
   begin_install_transaction
   configure_web_defaults_for_update
   local current_port new_port new_prefix new_https
@@ -2233,7 +2632,7 @@ change_limit() {
 token_list() {
   [ -x "${BIN_PATH}" ] || die "请先安装 hashcake 二进制"
   id -u "${SERVICE_USER}" >/dev/null 2>&1 || die "服务用户不存在：${SERVICE_USER}"
-  run_as_service_user "${BIN_PATH}" --config "${CONFIG_FILE}" token list --store "${STATE_DIR}/tokens.json"
+  run_hashcake_as_service_user "${BIN_PATH}" --config "${CONFIG_FILE}" token list --store "${STATE_DIR}/tokens.json"
 }
 
 token_revoke() {
@@ -2248,7 +2647,7 @@ token_revoke() {
     fi
   fi
   [ -n "${site}" ] || die "site_id 不能为空"
-  run_as_service_user "${BIN_PATH}" --config "${CONFIG_FILE}" token revoke "${site}" --store "${STATE_DIR}/tokens.json"
+  run_hashcake_as_service_user "${BIN_PATH}" --config "${CONFIG_FILE}" token revoke "${site}" --store "${STATE_DIR}/tokens.json"
   ok "已撤销 ${site}"
 }
 
@@ -2304,7 +2703,7 @@ token_issue() {
   [ -n "${ttl}" ] && args+=(--ttl "${ttl}")
   [ "${single_cover}" = "1" ] && args+=(--single-cover)
 
-  run_as_service_user "${BIN_PATH}" "${args[@]}"
+  run_hashcake_as_service_user "${BIN_PATH}" "${args[@]}"
 }
 
 uninstall() {
@@ -2423,8 +2822,8 @@ case "${cmd}" in
   token-revoke) shift; token_revoke "$@" ;;
   write-service)
     preflight_install_or_update
+    prepare_install_transaction_environment
     is_installed || die "请先安装 HashCake"
-    ensure_dirs
     begin_install_transaction
     configure_web_defaults_for_update
     ensure_metrics_token
