@@ -55,7 +55,7 @@ bash <(curl -fsSL https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@fbd28aee583ec
 Windows amd64 版本可在 Release 页面下载：
 
 ```text
-https://github.com/CakeSystem/hashcake/releases/download/v0.1.2/hashcake-0.1.2-windows.exe
+https://github.com/CakeSystem/hashcake/releases/download/v0.1.4/hashcake-0.1.4-windows.exe
 ```
 
 ## 更新 HashCake
