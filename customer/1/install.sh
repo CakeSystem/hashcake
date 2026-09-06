@@ -47,7 +47,8 @@ FIRST_WEB_TOKEN=""
 # truth; installer confirmation only makes its hash survive the final restart.
 BOOTSTRAP_TTL_MINUTES=10
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_SOURCE}")" && pwd)"
 SOURCE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
@@ -749,6 +750,7 @@ firewall_unit_list() {
 
 FIREWALL_SNAPSHOT_DIR=""
 FIREWALL_ROLLBACK_ARMED=0
+FIREWALL_PRESERVED=0
 INSTALL_TRANSACTION_ACTIVE=0
 INSTALL_TRANSACTION_DIR=""
 INSTALL_CANDIDATE_DIR=""
@@ -1530,11 +1532,45 @@ disable_firewall_now() {
   warn "整机防火墙已按 HashCake 运行要求关闭；云厂商安全组和上游网络 ACL 不受安装器控制。"
 }
 
+configure_install_firewall() {
+  FIREWALL_PRESERVED=0
+  if command_exists nft; then
+    local rules policy
+    rules="$(nft -j list ruleset)" \
+      || die "无法读取现有 nftables 配置，防火墙尚未修改"
+    policy="$(python3 -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+objects = data.get("nftables") if isinstance(data, dict) else None
+if not isinstance(objects, list) or any(not isinstance(item, dict) for item in objects):
+    raise SystemExit("invalid nftables ruleset")
+print("preserve" if any(set(item) - {"metainfo"} for item in objects) else "empty")
+' <<< "${rules}")" || die "无法解析现有 nftables 配置，防火墙尚未修改"
+    if [ "${policy}" = "preserve" ]; then
+      # Stopping nftables.service can flush rules owned by unrelated services.
+      FIREWALL_PRESERVED=1
+      warn "已保留现有 nftables 配置和防火墙服务状态；请按需放行 HashCake 端口"
+      return 0
+    fi
+  fi
+  arm_firewall_rollback
+  disable_firewall_now
+}
+
+print_install_firewall_notice() {
+  if [ "${FIREWALL_PRESERVED}" = "1" ]; then
+    printf '%s\n' '提示: 已保留现有防火墙规则和服务状态；请在主机防火墙及云厂商安全组放行 HashCake 实际使用的端口。'
+  else
+    printf '%s\n' '提示: 整机防火墙已关闭并禁用；云厂商安全组仍需允许 HashCake 实际使用的端口。'
+  fi
+}
+
 disable_firewall() {
   need_root
   acquire_installer_lock
-  arm_firewall_rollback
-  disable_firewall_now
+  configure_install_firewall
   commit_firewall_change
 }
 
@@ -2316,8 +2352,8 @@ EOF
   cat <<EOF
 安全访问路径: /${URL_PREFIX}/
 HTTPS: ${HTTPS_ACTIVE}
-提示: 整机防火墙已关闭并禁用；云厂商安全组仍需允许 HashCake 实际使用的端口。
 EOF
+  print_install_firewall_notice
   case "${HTTPS_ACTIVE}" in
     true|1|yes|on) warn "当前使用自签 HTTPS 证书，浏览器首次访问提示不受信任是预期行为" ;;
   esac
@@ -2351,8 +2387,7 @@ install_service() {
     *) die "无法识别后台状态：${admin_state}" ;;
   esac
   systemctl enable "${SERVICE_NAME}.service"
-  arm_firewall_rollback
-  disable_firewall_now
+  configure_install_firewall
   if [ "${needs_bootstrap}" = "1" ]; then
     if [ -f "${LOG_DIR}/hashcake.err.log" ]; then
       bootstrap_log_start=$(( $(wc -l < "${LOG_DIR}/hashcake.err.log") + 1 ))
@@ -2391,8 +2426,7 @@ update_service() {
   install_binary
   write_service
   systemctl enable "${SERVICE_NAME}.service"
-  arm_firewall_rollback
-  disable_firewall_now
+  configure_install_firewall
   if [ "${START_AFTER_INSTALL}" = "1" ]; then
     restart_service 0
   else
@@ -2406,8 +2440,9 @@ update_service() {
 当前版本: $([ -x "${BIN_PATH}" ] && run_hashcake_as_service_user "${BIN_PATH}" --version 2>/dev/null || printf '未知')
 后台访问地址: $(admin_url)
 安全访问路径: /${URL_PREFIX}/
-提示: 更新已保留 Web 端口、安全访问路径、账号、令牌、配置和状态目录，并重新确认整机防火墙已关闭。
+提示: 更新已保留 Web 端口、安全访问路径、账号、令牌、配置和状态目录。
 EOF
+  print_install_firewall_notice
 }
 
 start_service() {
