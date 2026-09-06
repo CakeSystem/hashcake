@@ -1544,7 +1544,15 @@ data = json.load(sys.stdin)
 objects = data.get("nftables") if isinstance(data, dict) else None
 if not isinstance(objects, list) or any(not isinstance(item, dict) for item in objects):
     raise SystemExit("invalid nftables ruleset")
-print("preserve" if any(set(item) - {"metainfo"} for item in objects) else "empty")
+for item in objects:
+    if "rule" in item:
+        print("preserve")
+        raise SystemExit(0)
+    chain = item.get("chain")
+    if isinstance(chain, dict) and chain.get("hook") and chain.get("policy", "accept") != "accept":
+        print("preserve")
+        raise SystemExit(0)
+print("empty")
 ' <<< "${rules}")" || die "无法解析现有 nftables 配置，防火墙尚未修改"
     if [ "${policy}" = "preserve" ]; then
       # Stopping nftables.service can flush rules owned by unrelated services.
