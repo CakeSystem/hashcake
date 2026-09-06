@@ -36,6 +36,7 @@ bash <(curl -fsSL https://cdn.jsdmirror.com/gh/CakeSystem/hashcake@e47b081b2cbd7
 
 ## 安装器可靠性
 
+- 手动替换程序后，启动或重启会自动补齐必要设置，可离线执行并保留原配置；损坏程序会在重启前被拦截。
 - 官方二进制下载会强制核对 `SHA256SUMS`，并在执行前检查实际版本与运行兼容性。
 - 首次安装或更新失败会恢复旧二进制、服务文件、配置元数据和防火墙状态，避免留下半安装状态。
 - 默认配置位于 `/opt/hashcake/config/hashcake.yaml`；旧路径会在更新时安全迁移。
