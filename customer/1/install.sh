@@ -2454,14 +2454,7 @@ EOF
 }
 
 start_service() {
-  need_root
-  has_systemd || die "当前系统没有可用 systemd"
-  is_complete_install || die "HashCake 安装不完整，请先执行 install 修复或 update 更新"
-  if ! restart_service_checked; then
-    systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
-    die "${SERVICE_NAME}.service 启动失败或未能稳定运行"
-  fi
-  status_service
+  restart_service
 }
 
 stop_service() {
@@ -2478,38 +2471,115 @@ stop_service() {
 restart_service_checked() {
   local restarts_baseline restarts_first restarts_second pid_first pid_second
   systemctl daemon-reload || return 1
+  systemctl reset-failed "${SERVICE_NAME}.service" || return 1
   systemctl restart "${SERVICE_NAME}.service" || return 1
-  restarts_baseline="$(systemctl show "${SERVICE_NAME}.service" -p NRestarts --value 2>/dev/null || printf '0')"
+  restarts_baseline="$(systemctl show "${SERVICE_NAME}.service" -p NRestarts --value)" || return 1
+  [ "${restarts_baseline}" = "0" ] || return 1
   sleep 2
   if ! systemctl is-active --quiet "${SERVICE_NAME}.service"; then
     return 1
   fi
-  restarts_first="$(systemctl show "${SERVICE_NAME}.service" -p NRestarts --value 2>/dev/null || printf '0')"
-  pid_first="$(systemctl show "${SERVICE_NAME}.service" -p MainPID --value 2>/dev/null || printf '0')"
-  if [[ "${restarts_baseline}" =~ ^[0-9]+$ && "${restarts_first}" =~ ^[0-9]+$ && "${pid_first}" =~ ^[0-9]+$ ]]; then
-    if [ "${restarts_first}" -gt "${restarts_baseline}" ] || [ "${pid_first}" -le 0 ]; then
-      return 1
-    fi
-  fi
+  restarts_first="$(systemctl show "${SERVICE_NAME}.service" -p NRestarts --value)" || return 1
+  pid_first="$(systemctl show "${SERVICE_NAME}.service" -p MainPID --value)" || return 1
+  [ "${restarts_first}" = "0" ] || return 1
+  [[ "${pid_first}" =~ ^[0-9]+$ ]] && [ "${pid_first}" -gt 0 ] || return 1
   sleep 2
   if ! systemctl is-active --quiet "${SERVICE_NAME}.service"; then
     return 1
   fi
-  restarts_second="$(systemctl show "${SERVICE_NAME}.service" -p NRestarts --value 2>/dev/null || printf '0')"
-  pid_second="$(systemctl show "${SERVICE_NAME}.service" -p MainPID --value 2>/dev/null || printf '0')"
-  if [[ "${restarts_first}" =~ ^[0-9]+$ && "${restarts_second}" =~ ^[0-9]+$ && "${pid_first}" =~ ^[0-9]+$ && "${pid_second}" =~ ^[0-9]+$ ]]; then
-    [ "${restarts_second}" = "${restarts_first}" ] || return 1
-    [ "${pid_second}" = "${pid_first}" ] || return 1
+  restarts_second="$(systemctl show "${SERVICE_NAME}.service" -p NRestarts --value)" || return 1
+  pid_second="$(systemctl show "${SERVICE_NAME}.service" -p MainPID --value)" || return 1
+  [ "${restarts_second}" = "0" ] || return 1
+  [ "${pid_second}" = "${pid_first}" ] || return 1
+}
+
+service_exec_directory_matches() {
+  local environment unset_environment
+  environment="$(systemctl show "${SERVICE_NAME}.service" -p Environment --value)" \
+    || die "无法读取服务启动环境"
+  unset_environment="$(systemctl show "${SERVICE_NAME}.service" -p UnsetEnvironment --value)" \
+    || die "无法读取服务环境排除项"
+  python3 - "${STATE_DIR}" "${environment}" "${unset_environment}" <<'PY'
+import shlex
+import sys
+
+key = "HASHCAKE_ENVELOPE_EXEC_DIR"
+values = dict(item.split("=", 1) for item in shlex.split(sys.argv[2]) if "=" in item)
+unset = shlex.split(sys.argv[3])
+raise SystemExit(0 if values.get(key) == sys.argv[1] and key not in unset
+                 and key + "=" + sys.argv[1] not in unset else 1)
+PY
+}
+
+prepare_installed_service() {
+  require_bash_runtime
+  reject_space_path
+  validate_runtime_inputs
+  require_command python3
+  require_command timeout
+  acquire_installer_lock
+  is_complete_install || die "HashCake 安装不完整，请先修复本地程序和服务文件"
+  validate_root_controlled_parent "${SERVICE_FILE}" "systemd 服务文件"
+  [ ! -L "${SERVICE_FILE}" ] && [ "$(stat -c '%u' -- "${SERVICE_FILE}")" = "0" ] \
+    && [ $((8#$(stat -c '%a' -- "${SERVICE_FILE}") & 8#022)) -eq 0 ] \
+    || die "服务文件必须由 root 管理且不能是符号链接或被其他用户写入"
+  systemctl daemon-reload
+  local actual_user actual_group actual_home fragment version_output service_tmp
+  actual_user="$(systemctl show "${SERVICE_NAME}.service" -p User --value)"
+  actual_group="$(systemctl show "${SERVICE_NAME}.service" -p Group --value)"
+  actual_home="$(systemctl show "${SERVICE_NAME}.service" -p WorkingDirectory --value)"
+  fragment="$(systemctl show "${SERVICE_NAME}.service" -p FragmentPath --value)"
+  [ "${actual_user}" = "${SERVICE_USER}" ] && [ "${actual_group}" = "${SERVICE_GROUP}" ] \
+    && [ "${actual_home}" = "${INSTALL_DIR}" ] && [ "${fragment}" = "${SERVICE_FILE}" ] \
+    || die "现有服务的用户或安装路径与脚本不一致，请沿用原安装参数；未修改服务"
+  prepare_install_transaction_environment
+  [ ! -L "${BIN_PATH}" ] && [ -f "${BIN_PATH}" ] || die "HashCake 程序不能是符号链接或非普通文件"
+  if ! version_output="$(run_hashcake_as_service_user timeout 15 "${BIN_PATH}" --version 2>&1)"; then
+    die "本地程序预检失败，未重启服务。原始错误：
+${version_output:-请检查程序权限、CPU 架构和运行目录。}"
+  fi
+  [ -n "$(extract_hashcake_version "${version_output}")" ] || die "本地程序未返回有效的 HashCake 版本号"
+  service_exec_directory_matches && return 0
+
+  # Append only the required environment setting; preserve custom unit contents.
+  begin_install_transaction
+  service_tmp="$(mktemp "${SERVICE_FILE}.XXXXXX.service")"
+  cp -p -- "${SERVICE_FILE}" "${service_tmp}"
+  printf '\n[Service]\nEnvironment="HASHCAKE_ENVELOPE_EXEC_DIR=%s"\n' "${STATE_DIR}" >> "${service_tmp}"
+  if command_exists systemd-analyze && ! systemd-analyze verify "${service_tmp}"; then
+    rm -f -- "${service_tmp}"
+    die "服务配置校验失败，未重启服务"
+  fi
+  TXN_SERVICE_CHANGED=1
+  mv -fT -- "${service_tmp}" "${SERVICE_FILE}"
+  systemctl daemon-reload
+  service_exec_directory_matches || die "启动设置被服务附加配置覆盖，无法自动修复"
+  ok "已补齐本地程序所需的启动设置，原配置和服务参数保持不变"
+}
+
+show_service_start_failure() {
+  systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
+  if [ -f "${LOG_DIR}/hashcake.err.log" ]; then
+    printf '最近启动错误（完整日志：%s/hashcake.err.log）：\n' "${LOG_DIR}" >&2
+    tail -n 60 "${LOG_DIR}/hashcake.err.log" \
+      | grep -Ei '(^Error:|^Caused by:|^[[:space:]]+[0-9]+:|GLIBC_|Permission denied|thread .* panicked)' >&2 || true
   fi
 }
 
 restart_service() {
-  local show_status="${1:-1}"
+  local show_status="${1:-1}" own_transaction=0
   need_root
   has_systemd || die "当前系统没有可用 systemd"
+  if [ "${INSTALL_TRANSACTION_ACTIVE}" = "0" ]; then
+    own_transaction=1
+    prepare_installed_service
+  fi
   if ! restart_service_checked; then
-    systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
+    show_service_start_failure
     die "${SERVICE_NAME}.service 启动失败或未能稳定运行"
+  fi
+  if [ "${own_transaction}" = "1" ] && [ "${INSTALL_TRANSACTION_ACTIVE}" = "1" ]; then
+    commit_install_transaction
   fi
   if [ "${show_status}" = "1" ]; then
     status_service
