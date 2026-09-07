@@ -2534,9 +2534,15 @@ prepare_installed_service() {
     || die "现有服务的用户或安装路径与脚本不一致，请沿用原安装参数；未修改服务"
   prepare_install_transaction_environment
   [ ! -L "${BIN_PATH}" ] && [ -f "${BIN_PATH}" ] || die "HashCake 程序不能是符号链接或非普通文件"
+  chmod 0755 -- "${BIN_PATH}" || die "无法修正 HashCake 程序权限：${BIN_PATH}"
+  chown root:root -- "${BIN_PATH}" || die "无法修正 HashCake 程序属主：${BIN_PATH}"
+  local binary_stat
+  binary_stat="$(stat -c '权限=%a 属主=%u:%g 大小=%s' -- "${BIN_PATH}")" \
+    || die "无法读取 HashCake 程序属性：${BIN_PATH}"
   if ! version_output="$(run_hashcake_as_service_user timeout 15 "${BIN_PATH}" --version 2>&1)"; then
     die "本地程序预检失败，未重启服务。原始错误：
-${version_output:-请检查程序权限、CPU 架构和运行目录。}"
+${version_output:-请检查程序权限、CPU 架构和运行目录。}
+文件属性：${binary_stat}"
   fi
   [ -n "$(extract_hashcake_version "${version_output}")" ] || die "本地程序未返回有效的 HashCake 版本号"
   service_exec_directory_matches && return 0
