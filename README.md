@@ -47,7 +47,7 @@ sudo bash install-hashcake.sh
 无法稳定访问 GitHub 的服务器使用下面的通用管理入口。该命令不绑定当前已安装版本；选择安装或更新时，安装器会自动查找官方最新稳定版，并根据 SHA256SUMS 校验下载文件：
 
 ```bash
-bash <(curl -fsSL https://cdn.jsdmirror.com/gh/hashultra/hashcake@b8256bc163537f0c1b663e7b5b3099e128fd7845/install.sh)
+bash <(curl -fsSL https://cdn.jsdmirror.com/gh/hashultra/hashcake@89999b89019e82b17d33cc9e14878610947d2946/install.sh)
 ```
 
 ### Windows
@@ -65,5 +65,7 @@ sudo bash install-hashcake.sh update
 ```
 
 更新会保留已有 Web 端口、安全访问路径、账号、令牌、配置和状态目录。新版本启动失败时，安装器会自动恢复旧二进制、旧服务文件和原有防火墙状态。
+
+管理菜单里的“15. 修改后台账号密码”可以在 SSH 侧改密：知道当前密码时直接修改并复验；忘记密码时在同一入口重置，脚本会先备份状态文件再重建 Owner 账号（现有后台账号会被删除）。
 
 已手动替换程序的离线服务器，把新版安装脚本传入后，选择菜单“5. 重启”即可。脚本会自动补齐必要启动设置并检查本地程序，不会联网下载、重新安装或重置账号。
